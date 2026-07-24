@@ -9,108 +9,80 @@ import io
 
 app = Flask(__name__)
 
-STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
 CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
 
-def fetch_true_new_ventures(days=3):
+def fetch_new_ventures(days=3):
     today = datetime.now()
     start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
-    print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
+    print(f"[*] Fetching strict new ventures since {start_date} (last {days} days)...")
     
-    all_status_changes = []
-    limit = 500
+    all_carriers = []
+    limit = 1000
     offset = 0
     
     while True:
         params = {
-            "$where": f"status_change_date >= '{start_date}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
+            "$where": f"add_date >= '{start_date}' AND status_code = 'A'",
             "$limit": limit,
             "$offset": offset,
-            "$order": "status_change_date DESC"
-        }
-        try:
-            resp = requests.get(STATUS_CHANGE_URL, params=params)
-            resp.raise_for_status()
-            batch = resp.json()
-        except Exception as e:
-            print(f"[!] Error fetching status changes: {e}")
-            break
-            
-        if not batch:
-            break
-        all_status_changes.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    print(f"[+] Fetched {len(all_status_changes)} status change records.")
-    if not all_status_changes:
-        return []
-
-    status_map = {}
-    for sc in all_status_changes:
-        dot = sc.get("usdot_number")
-        if dot and dot not in status_map:
-            status_map[dot] = sc
-
-    unique_dots = list(status_map.keys())
-    print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
-
-    carrier_records = []
-    batch_size = 50
-    for i in range(0, len(unique_dots), batch_size):
-        batch_dots = unique_dots[i:i+batch_size]
-        dots_str = ",".join([f"'{d}'" for d in batch_dots])
-        params = {
-            "$where": f"dot_number in ({dots_str})",
-            "$limit": batch_size
+            "$order": "add_date DESC"
         }
         try:
             resp = requests.get(CARRIER_INFO_URL, params=params)
             resp.raise_for_status()
-            carrier_records.extend(resp.json())
+            batch = resp.json()
         except Exception as e:
-            print(f"[!] Error fetching carrier batch: {e}")
+            print(f"[!] API error: {e}")
+            break
+            
+        if not batch:
+            break
+        all_carriers.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
 
-    combined = []
-    cutoff_date_str = start_date
-
-    for cd in carrier_records:
+    print(f"[+] Retrieved {len(all_carriers)} verified active new ventures for {days} days.")
+    
+    verified_ventures = []
+    for cd in all_carriers:
         dot = cd.get("dot_number")
-        sc = status_map.get(dot, {})
-        add_date = cd.get("add_date", "")
-        status_change_date = sc.get("status_change_date", "")
-        
-        is_recent_add = add_date and add_date >= cutoff_date_str
-        is_recent_status = status_change_date and status_change_date >= cutoff_date_str
-        
-        if not (is_recent_add or is_recent_status):
+        legal_name = cd.get("legal_name", "").strip()
+        if not dot or not legal_name:
             continue
+
+        add_date = cd.get("add_date", "")
+        if not add_date or add_date < start_date:
+            continue
+
+        docket = cd.get("docket1", "")
+        if docket and cd.get("docket1prefix"):
+            docket = f"{cd.get('docket1prefix')}{docket}"
 
         merged = {
             "usdot_number": dot,
-            "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
-            "legal_name": cd.get("legal_name") or "",
-            "dba_name": cd.get("dba_name") or "",
-            "add_date": add_date or status_change_date,
-            "status_change_date": status_change_date,
-            "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
-            "reason": sc.get("reason") or "Initial Status",
-            "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
-            "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
-            "email_address": cd.get("email_address") or "N/A",
+            "docket_number": docket or "—",
+            "legal_name": legal_name,
+            "dba_name": cd.get("dba_name") or "—",
+            "add_date": add_date,
+            "status_change_date": cd.get("mcs150_date", add_date),
+            "op_auth_status": "ACTIVE" if cd.get("status_code") == "A" else "PENDING",
+            "reason": "Initial Registration",
+            "op_auth_type": cd.get("classdef") or "Authorized For Hire",
+            "phone": cd.get("phone") or cd.get("cell_phone") or "—",
+            "email_address": cd.get("email_address") or "—",
             "phy_street": cd.get("phy_street") or "",
             "phy_city": cd.get("phy_city") or "",
             "phy_state": cd.get("phy_state") or "",
             "phy_zip": cd.get("phy_zip") or "",
             "power_units": int(cd.get("power_units") or 1),
+            "drivers": int(cd.get("total_drivers") or cd.get("total_cdl") or 1),
             "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
         }
-        combined.append(merged)
+        verified_ventures.append(merged)
 
-    combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(combined)} true new ventures for last {days} days.")
-    return combined
+    verified_ventures.sort(key=lambda x: x["add_date"], reverse=True)
+    return verified_ventures
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -181,54 +153,64 @@ HTML_TEMPLATE = """
         .hero-section {
             background: #ffffff;
             border-bottom: 1px solid var(--border-color);
-            padding: 2.5rem 1.5rem;
+            padding: 3rem 1.5rem;
             text-align: center;
         }
         .hero-title {
             font-weight: 800;
-            font-size: 2.25rem;
+            font-size: 2.5rem;
             color: var(--text-dark);
             letter-spacing: -0.02em;
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.75rem;
         }
         .hero-subtitle {
             color: var(--text-muted);
+            font-size: 1.05rem;
+            margin-bottom: 2rem;
+        }
+        .search-container {
+            max-width: 700px;
+            margin: 0 auto;
+            position: relative;
+        }
+        .search-input {
+            width: 100%;
+            padding: 1rem 1rem 1rem 3.25rem;
+            border-radius: 12px;
+            border: 2px solid var(--border-color);
             font-size: 1rem;
-            margin-bottom: 1.5rem;
+            background: #fff;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.03);
+            transition: all 0.2s ease;
+        }
+        .search-input:focus {
+            border-color: var(--brand-green);
+            box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.15);
+            outline: none;
+        }
+        .search-icon {
+            position: absolute;
+            left: 1.25rem;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            font-size: 1.1rem;
         }
 
-        /* Main Container */
+        /* Layout */
         .main-container {
             max-width: 1440px;
             margin: 2rem auto;
             padding: 0 1.5rem;
         }
 
-        /* Stat Cards */
-        .card-stat {
-            background: #ffffff;
-            border: 1px solid var(--border-color);
-            border-radius: 14px;
-            padding: 1.25rem;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
-            position: relative;
-            overflow: hidden;
-        }
-        .card-stat::before {
-            content: '';
-            position: absolute;
-            top: 0; left: 0; width: 4px; height: 100%;
-            background: var(--card-accent, var(--brand-green));
-        }
-
-        /* Filters & Panels */
-        .filter-card, .panel-card {
+        /* Filters Box */
+        .filter-card {
             background: #ffffff;
             border: 1px solid var(--border-color);
             border-radius: 14px;
             padding: 1.5rem;
             box-shadow: 0 2px 10px rgba(0,0,0,0.02);
-            margin-bottom: 1.5rem;
         }
         .filter-title {
             font-weight: 700;
@@ -239,7 +221,7 @@ HTML_TEMPLATE = """
             margin-bottom: 1rem;
         }
 
-        /* Tables */
+        /* Table Card */
         .table-card {
             background: #ffffff;
             border: 1px solid var(--border-color);
@@ -277,20 +259,29 @@ HTML_TEMPLATE = """
             font-size: 0.9rem;
         }
         .table-container {
-            max-height: 600px;
+            max-height: 650px;
             overflow-y: auto;
         }
 
         /* Badges */
         .status-badge {
+            background: rgba(16, 185, 129, 0.15);
+            color: #059669;
             font-weight: 700;
             font-size: 0.7rem;
             padding: 5px 10px;
             border-radius: 6px;
             letter-spacing: 0.05em;
         }
-        .badge-active { background: rgba(16, 185, 129, 0.15); color: #059669; }
-        .badge-pending { background: rgba(245, 158, 11, 0.15); color: #d97706; }
+        .carrier-tag {
+            background: #f1f5f9;
+            color: #475569;
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
 
         .btn-green {
             background: var(--brand-green);
@@ -350,6 +341,10 @@ HTML_TEMPLATE = """
         <div class="container">
             <h1 class="hero-title">Look up any FMCSA new venture</h1>
             <p class="hero-subtitle">Free, public motor-carrier data — search by name, DOT#, MC#, location, cargo, or contact.</p>
+            <div class="search-container">
+                <i class="fa-solid fa-search search-icon"></i>
+                <input type="text" id="heroSearch" class="search-input" placeholder="Company name, DOT # / MC # ..." onkeyup="filterTableFromHero()">
+            </div>
         </div>
     </section>
 
@@ -358,35 +353,8 @@ HTML_TEMPLATE = """
 
         <!-- DASHBOARD TAB -->
         <div id="tab-dashboard">
-            <!-- Stats Row -->
-            <div class="row g-3 mb-4">
-                <div class="col-md-3">
-                    <div class="card card-stat" style="--card-accent: #10b981;">
-                        <span class="text-muted small fw-bold text-uppercase">Total New Ventures</span>
-                        <h3 id="statTotal" class="fw-bold mt-1 mb-0 text-dark">0</h3>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card card-stat" style="--card-accent: #f59e0b;">
-                        <span class="text-muted small fw-bold text-uppercase">Pending Authorities</span>
-                        <h3 id="statPending" class="fw-bold mt-1 mb-0 text-warning">0</h3>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card card-stat" style="--card-accent: #0ea5e9;">
-                        <span class="text-muted small fw-bold text-uppercase">States Covered</span>
-                        <h3 id="statStates" class="fw-bold mt-1 mb-0 text-info">0</h3>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card card-stat" style="--card-accent: #6366f1;">
-                        <span class="text-muted small fw-bold text-uppercase">Total Power Units</span>
-                        <h3 id="statUnits" class="fw-bold mt-1 mb-0 text-primary">0</h3>
-                    </div>
-                </div>
-            </div>
-
             <div class="row g-4">
+                
                 <!-- Filters Sidebar -->
                 <div class="col-lg-3">
                     <div class="filter-card">
@@ -417,8 +385,8 @@ HTML_TEMPLATE = """
                             <label class="form-label small fw-bold text-muted">Status</label>
                             <select id="statusFilter" class="form-select form-select-sm" onchange="filterTable()">
                                 <option value="">All Statuses</option>
-                                <option value="Active">Active</option>
-                                <option value="Pending">Pending</option>
+                                <option value="ACTIVE">Active</option>
+                                <option value="PENDING">Pending</option>
                             </select>
                         </div>
                     </div>
@@ -428,12 +396,9 @@ HTML_TEMPLATE = """
                 <div class="col-lg-9">
                     <div class="table-card">
                         <div class="table-header-bar">
-                            <div class="w-50">
-                                <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search company name, USDOT, city, email..." onkeyup="filterTable()">
-                            </div>
+                            <span id="resultCount" class="text-muted small fw-semibold">Showing 0 results</span>
                             <div class="d-flex gap-2">
-                                <span id="resultCount" class="text-muted small fw-semibold align-self-center me-2">Showing 0 results</span>
-                                <a href="/download/csv" class="btn btn-green btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
+                                <a href="/download/csv" class="btn btn-outline-secondary btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
                             </div>
                         </div>
 
@@ -460,7 +425,7 @@ HTML_TEMPLATE = """
 
         <!-- WEBHOOK TAB -->
         <div id="tab-webhook" class="tab-pane" style="display: none;">
-            <div class="panel-card">
+            <div class="filter-card">
                 <h4 class="fw-bold text-success mb-3"><i class="fa-solid fa-link me-2"></i> n8n Webhook & API Endpoints</h4>
                 <p class="text-muted mb-4">Use these endpoints to integrate your GreenSearch platform into n8n or automated scripts.</p>
                 
@@ -515,7 +480,6 @@ HTML_TEMPLATE = """
                     allData = result.data;
                     populateStateDropdown(allData);
                     renderTable(allData);
-                    updateStats(allData);
                 } else {
                     alert('Failed to load data');
                 }
@@ -548,7 +512,6 @@ HTML_TEMPLATE = """
             }
 
             data.forEach(item => {
-                const statusClass = item.op_auth_status === 'Active' ? 'badge-active' : 'badge-pending';
                 const row = `<tr>
                     <td>
                         <div class="fw-bold text-dark">${item.legal_name}</div>
@@ -559,35 +522,28 @@ HTML_TEMPLATE = """
                     <td><span class="font-monospace">${item.docket_number}</span></td>
                     <td>${item.phy_city}, ${item.phy_state}</td>
                     <td><span class="fw-semibold">${item.power_units}</span></td>
-                    <td><span class="status-badge ${statusClass}">${item.op_auth_status}</span></td>
+                    <td><span class="status-badge">${item.op_auth_status}</span></td>
                 </tr>`;
                 tbody.innerHTML += row;
             });
         }
 
-        function updateStats(data) {
-            document.getElementById('statTotal').innerText = data.length;
-            const pendingCount = data.filter(i => i.op_auth_status === 'Pending').length;
-            document.getElementById('statPending').innerText = pendingCount;
-            const states = new Set(data.map(i => i.phy_state)).size;
-            document.getElementById('statStates').innerText = states;
-            const totalUnits = data.reduce((acc, curr) => acc + (parseInt(curr.power_units) || 0), 0);
-            document.getElementById('statUnits').innerText = totalUnits;
-        }
-
         function filterTable() {
-            const query = document.getElementById('searchInput').value.toLowerCase();
+            const query = document.getElementById('searchInput') ? document.getElementById('searchInput').value.toLowerCase() : '';
+            const heroQuery = document.getElementById('heroSearch') ? document.getElementById('heroSearch').value.toLowerCase() : '';
+            const activeQuery = query || heroQuery;
+
             const selectedState = document.getElementById('stateFilter').value;
             const selectedStatus = document.getElementById('statusFilter').value;
 
             const filtered = allData.filter(item => {
                 const matchesQuery = (
-                    (item.legal_name && item.legal_name.toLowerCase().includes(query)) ||
-                    (item.usdot_number && item.usdot_number.toLowerCase().includes(query)) ||
-                    (item.docket_number && item.docket_number.toLowerCase().includes(query)) ||
-                    (item.phy_city && item.phy_city.toLowerCase().includes(query)) ||
-                    (item.phy_state && item.phy_state.toLowerCase().includes(query)) ||
-                    (item.email_address && item.email_address.toLowerCase().includes(query))
+                    (item.legal_name && item.legal_name.toLowerCase().includes(activeQuery)) ||
+                    (item.usdot_number && item.usdot_number.toLowerCase().includes(activeQuery)) ||
+                    (item.docket_number && item.docket_number.toLowerCase().includes(activeQuery)) ||
+                    (item.phy_city && item.phy_city.toLowerCase().includes(activeQuery)) ||
+                    (item.phy_state && item.phy_state.toLowerCase().includes(activeQuery)) ||
+                    (item.email_address && item.email_address.toLowerCase().includes(activeQuery))
                 );
                 const matchesState = !selectedState || item.phy_state === selectedState;
                 const matchesStatus = !selectedStatus || item.op_auth_status === selectedStatus;
@@ -596,19 +552,21 @@ HTML_TEMPLATE = """
             renderTable(filtered);
         }
 
+        function filterTableFromHero() {
+            const heroVal = document.getElementById('heroSearch').value;
+            if (document.getElementById('searchInput')) {
+                document.getElementById('searchInput').value = heroVal;
+            }
+            filterTable();
+        }
+
         function resetFilters() {
-            document.getElementById('searchInput').value = '';
+            if (document.getElementById('searchInput')) document.getElementById('searchInput').value = '';
+            if (document.getElementById('heroSearch')) document.getElementById('heroSearch').value = '';
             document.getElementById('stateFilter').value = '';
             document.getElementById('statusFilter').value = '';
             document.getElementById('daysSelect').value = '3';
             loadData();
-        }
-
-        function copyText(elementId) {
-            const copyText = document.getElementById(elementId);
-            copyText.select();
-            navigator.clipboard.writeText(copyText.value);
-            alert("Copied to clipboard!");
         }
 
         window.onload = () => {
@@ -630,7 +588,7 @@ def api_data():
     except ValueError:
         days = 3
 
-    data = fetch_true_new_ventures(days=days)
+    data = fetch_new_ventures(days=days)
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
@@ -652,7 +610,7 @@ def run_pipeline():
     except ValueError:
         days = 3
 
-    data = fetch_true_new_ventures(days=days)
+    data = fetch_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
@@ -682,7 +640,7 @@ def n8n_webhook():
     except (ValueError, TypeError):
         days = 3
 
-    data = fetch_true_new_ventures(days=days)
+    data = fetch_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
@@ -701,7 +659,7 @@ def download_csv():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
     if os.path.exists(latest_path):
-        return send_file(latest_path, mimetype="text/css" if False else "text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
+        return send_file(latest_path, mimetype="text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
     return jsonify({"error": "No CSV file generated yet."}), 404
 
 if __name__ == "__main__":
