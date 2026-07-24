@@ -498,7 +498,7 @@ HTML_TEMPLATE = """
             }
 
             data.forEach(item => {
-                const statusClass = item.op_auth_status === 'Active' || item.op_auth_status === 'ACTIVE' ? 'badge-active' : 'badge-pending';
+                const statusClass = item.op_auth_status === 'ACTIVE' ? 'badge-active' : 'badge-pending';
                 const row = `<tr>
                     <td>
                         <div class="fw-bold text-dark">${item.legal_name}</div>
@@ -530,7 +530,7 @@ HTML_TEMPLATE = """
                     (item.email_address && item.email_address.toLowerCase().includes(query))
                 );
                 const matchesState = !selectedState || item.phy_state === selectedState;
-                const matchesStatus = !selectedStatus || item.op_auth_status.toLowerCase() === selectedStatus.toLowerCase();
+                const matchesStatus = !selectedStatus || item.op_auth_status === selectedStatus;
                 return matchesQuery && matchesState && matchesStatus;
             });
             renderTable(filtered);
@@ -647,4 +647,3 @@ def download_csv():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-,path:/home/user/app.py}
