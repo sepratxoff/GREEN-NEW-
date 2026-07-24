@@ -1,8 +1,3 @@
-Here is the complete, final, and fully verified code for **`app.py`**. 
-
-It includes the **GreenSearch** professional green/white styling, CSV-only exports, no dashboard stat cards, responsive timeframe dropdowns, and the strict backend data validation engine guaranteeing zero old records across any timeframe (1, 3, 7, 14, or 30 days).
-
-```python
 import os
 from flask import Flask, render_template_string, request, jsonify, send_file
 import requests
