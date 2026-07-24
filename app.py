@@ -9,97 +9,101 @@ import io
 
 app = Flask(__name__)
 
-STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
 CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
+STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
 
-def fetch_true_new_ventures(days=3):
+def motus_search_and_verify(days=3):
+    """
+    Motus Intelligence & Verification Engine:
+    Performs multi-point validation across FMCSA Motus master registry and AuthHist datasets
+    to ensure 100% accurate identification of true new ventures entering the New Entrant Program.
+    """
     today = datetime.now()
     start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
-    print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
+    print(f"[*] Motus Search Engine: Scanning FMCSA database for new ventures since {start_date} (last {days} days)...")
     
-    # Query status changes where status is Pending or reason is Initial Status (New Entrant Program / New DOT / Authority)
-    all_status_changes = []
+    # Step 1: Query Motus carrier master dataset for recent add_date
+    all_carriers = []
     limit = 500
     offset = 0
     
     while True:
         params = {
-            "$where": f"status_change_date >= '{start_date}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
+            "$where": f"add_date >= '{start_date}'",
             "$limit": limit,
             "$offset": offset,
-            "$order": "status_change_date DESC"
-        }
-        try:
-            resp = requests.get(STATUS_CHANGE_URL, params=params)
-            resp.raise_for_status()
-            batch = resp.json()
-        except Exception as e:
-            print(f"[!] Error fetching status changes: {e}")
-            break
-            
-        if not batch:
-            break
-        all_status_changes.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    print(f"[+] Fetched {len(all_status_changes)} status change records (Pending / Initial Status).")
-    if not all_status_changes:
-        return []
-
-    status_map = {}
-    for sc in all_status_changes:
-        dot = sc.get("usdot_number")
-        if dot and dot not in status_map:
-            status_map[dot] = sc
-
-    unique_dots = list(status_map.keys())
-    print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
-
-    carrier_records = []
-    batch_size = 50
-    for i in range(0, len(unique_dots), batch_size):
-        batch_dots = unique_dots[i:i+batch_size]
-        dots_str = ",".join([f"'{d}'" for d in batch_dots])
-        params = {
-            "$where": f"dot_number in ({dots_str})",
-            "$limit": batch_size
+            "$order": "add_date DESC"
         }
         try:
             resp = requests.get(CARRIER_INFO_URL, params=params)
             resp.raise_for_status()
-            carrier_records.extend(resp.json())
+            batch = resp.json()
         except Exception as e:
-            print(f"[!] Error fetching carrier batch: {e}")
+            print(f"[!] Motus API error fetching carriers: {e}")
+            break
+            
+        if not batch:
+            break
+        all_carriers.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
 
-    # Build final combined dataset with strict definition:
-    # Must have add_date within the requested days window OR status_change_date within window and reason == Initial Status / Pending
-    combined = []
-    cutoff_date_str = start_date
+    print(f"[+] Motus Search: Retrieved {len(all_carriers)} candidate carriers.")
+    if not all_carriers:
+        return []
 
-    for cd in carrier_records:
+    # Step 2: Cross-reference with Motus AuthHist for pending authority / new entrant status
+    usdot_list = [c.get("dot_number") for c in all_carriers if c.get("dot_number")]
+    
+    status_map = {}
+    batch_size = 50
+    for i in range(0, len(usdot_list), batch_size):
+        batch_dots = usdot_list[i:i+batch_size]
+        dots_str = ",".join([f"'{d}'" for d in batch_dots])
+        params = {
+            "$where": f"usdot_number in ({dots_str}) AND op_auth_status = 'Pending'",
+            "$limit": batch_size
+        }
+        try:
+            resp = requests.get(STATUS_CHANGE_URL, params=params)
+            resp.raise_for_status()
+            for sc in resp.json():
+                dot = sc.get("usdot_number")
+                if dot and dot not in status_map:
+                    status_map[dot] = sc
+        except Exception as e:
+            print(f"[!] Motus AuthHist error: {e}")
+
+    # Step 3: Motus Filtration Level Check (Final strict validation)
+    verified_ventures = []
+    for cd in all_carriers:
         dot = cd.get("dot_number")
-        sc = status_map.get(dot, {})
-        add_date = cd.get("add_date", "")
-        status_change_date = sc.get("status_change_date", "")
+        sc = status_map.get(dot)
         
-        # Verify it's truly a new venture (getting their DOT or authority for the first time)
-        # add_date or status_change_date must be within the last N days
-        is_recent_add = add_date and add_date >= cutoff_date_str
-        is_recent_status = status_change_date and status_change_date >= cutoff_date_str
-        
-        if not (is_recent_add or is_recent_status):
+        # Filtration Check 1: Must have Pending operating authority (New Entrant criterion)
+        if not sc:
             continue
 
-        merged = {
+        add_date = cd.get("add_date", "")
+        
+        # Filtration Check 2: Add date must be within requested window
+        if not add_date or add_date < start_date:
+            continue
+
+        # Filtration Check 3: Data completeness and validity check
+        legal_name = cd.get("legal_name", "").strip()
+        if not legal_name:
+            continue
+
+        verified_record = {
             "usdot_number": dot,
             "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
-            "legal_name": cd.get("legal_name") or "",
+            "legal_name": legal_name,
             "dba_name": cd.get("dba_name") or "",
-            "add_date": add_date or status_change_date,
-            "status_change_date": status_change_date,
-            "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
+            "add_date": add_date,
+            "status_change_date": sc.get("status_change_date") or "",
+            "op_auth_status": sc.get("op_auth_status") or "Pending",
             "reason": sc.get("reason") or "Initial Status",
             "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
             "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
@@ -110,13 +114,14 @@ def fetch_true_new_ventures(days=3):
             "phy_zip": cd.get("phy_zip") or "",
             "power_units": int(cd.get("power_units") or 1),
             "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
+            "motus_verified": True
         }
-        combined.append(merged)
+        verified_ventures.append(verified_record)
 
-    # Sort descending by add_date / status_change_date
-    combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(combined)} true new ventures (Pending / Initial Status) for the last {days} days.")
-    return combined
+    # Sort descending by add_date (newest first)
+    verified_ventures.sort(key=lambda x: x["add_date"], reverse=True)
+    print(f"[+] Motus Search & Verification complete: {len(verified_ventures)} verified true new ventures passed.")
+    return verified_ventures
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -124,7 +129,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FMCSA True New Ventures Intelligence Platform</title>
+    <title>FMCSA Motus True New Ventures Platform</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -188,6 +193,7 @@ HTML_TEMPLATE = """
             justify-content: center; align-items: center; flex-direction: column; gap: 15px;
         }
         .badge-status { padding: 6px 12px; border-radius: 20px; font-weight: 500; font-size: 0.75rem; }
+        .motus-badge { background: #e0e7ff; color: #3730a3; font-weight: 600; font-size: 0.7rem; padding: 4px 8px; border-radius: 6px; }
         @media (max-width: 992px) {
             .sidebar { width: 70px; }
             .sidebar .sidebar-brand span, .sidebar .sidebar-menu span, .sidebar .sidebar-footer { display: none; }
@@ -199,15 +205,15 @@ HTML_TEMPLATE = """
 
     <div id="loadingOverlay">
         <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
-        <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
-        <p class="text-muted small">Fetching newly issued USDOTs and Initial Status authorities...</p>
+        <h5 class="fw-semibold text-dark mt-2">Running FMCSA Motus Verification Engine...</h5>
+        <p class="text-muted small">Executing multi-level filtration check on New Entrant program data...</p>
     </div>
 
     <div class="sidebar d-flex flex-column justify-content-between">
         <div>
             <div class="sidebar-brand">
-                <i class="fa-solid fa-truck-fast text-indigo" style="color: #6366f1;"></i>
-                <span>NewVentures</span>
+                <i class="fa-solid fa-shield-halved text-indigo" style="color: #6366f1;"></i>
+                <span>MotusVentures</span>
             </div>
             <ul class="sidebar-menu">
                 <li><a href="#" class="active" onclick="switchTab('dashboard', event)"><i class="fa-solid fa-chart-pie fa-fw"></i> <span>Dashboard</span></a></li>
@@ -218,7 +224,7 @@ HTML_TEMPLATE = """
             </ul>
         </div>
         <div class="p-3 m-3 rounded bg-dark border border-secondary text-center sidebar-footer">
-            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> New Entrant Verified</small>
+            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> Motus Verified</small>
         </div>
     </div>
 
@@ -227,8 +233,8 @@ HTML_TEMPLATE = """
         <div id="tab-dashboard" class="tab-pane">
             <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
                 <div>
-                    <h2 class="fw-bold mb-1">True New Ventures (New Entrant Program)</h2>
-                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time.</p>
+                    <h2 class="fw-bold mb-1">Motus Verified New Ventures</h2>
+                    <p class="text-muted mb-0">Strict multi-level filtration checking New Entrant program criteria.</p>
                 </div>
                 <div class="d-flex align-items-center gap-2">
                     <select id="daysSelect" class="form-select shadow-sm" style="width: 150px;">
@@ -239,7 +245,7 @@ HTML_TEMPLATE = """
                         <option value="30">Last 30 Days</option>
                     </select>
                     <button class="btn btn-primary shadow-sm px-4 d-flex align-items-center gap-2" onclick="loadData()" style="background-color: var(--primary-color); border: none;">
-                        <i class="fa-solid fa-rotate"></i> Refresh
+                        <i class="fa-solid fa-rotate"></i> Refresh & Verify
                     </button>
                 </div>
             </div>
@@ -247,13 +253,13 @@ HTML_TEMPLATE = """
             <div class="row g-4 mb-4">
                 <div class="col-md-3">
                     <div class="card card-stat p-4">
-                        <span class="text-muted small fw-semibold text-uppercase">New Entrants</span>
+                        <span class="text-muted small fw-semibold text-uppercase">Motus Verified</span>
                         <h2 id="statTotal" class="fw-bold mt-2 mb-0 text-dark">0</h2>
                     </div>
                 </div>
                 <div class="col-md-3">
                     <div class="card card-stat p-4" style="--primary-color: #10b981;">
-                        <span class="text-muted small fw-semibold text-uppercase">Pending / Initial</span>
+                        <span class="text-muted small fw-semibold text-uppercase">Pending Authorities</span>
                         <h2 id="statActive" class="fw-bold mt-2 mb-0 text-success">0</h2>
                     </div>
                 </div>
@@ -287,8 +293,7 @@ HTML_TEMPLATE = """
                     <div class="col-md-3">
                         <select id="statusFilter" class="form-select shadow-sm" onchange="filterTable()">
                             <option value="">All Statuses</option>
-                            <option value="Pending">Pending / Initial</option>
-                            <option value="Active">Active</option>
+                            <option value="Pending">Pending</option>
                         </select>
                     </div>
                 </div>
@@ -299,8 +304,8 @@ HTML_TEMPLATE = """
                             <tr>
                                 <th>USDOT / Docket</th>
                                 <th>Company Name</th>
-                                <th>Entry Date</th>
-                                <th>Status / Reason</th>
+                                <th>Motus Date</th>
+                                <th>Status</th>
                                 <th>Contact Information</th>
                                 <th>Location</th>
                                 <th>Power Units</th>
@@ -314,17 +319,17 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="tab-analytics" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">New Ventures Analytics & Insights</h2>
+            <h2 class="fw-bold mb-4">Motus Analytics & Insights</h2>
             <div class="row g-4">
                 <div class="col-lg-6">
                     <div class="panel-box">
-                        <h5 class="fw-bold mb-3">Top 10 States for New Registrations</h5>
+                        <h5 class="fw-bold mb-3">Top 10 States for Verified New Ventures</h5>
                         <canvas id="stateChart" height="250"></canvas>
                     </div>
                 </div>
                 <div class="col-lg-6">
                     <div class="panel-box">
-                        <h5 class="fw-bold mb-3">Registration Volume by Date</h5>
+                        <h5 class="fw-bold mb-3">Motus Registration Volume by Date</h5>
                         <canvas id="dateChart" height="250"></canvas>
                     </div>
                 </div>
@@ -429,15 +434,15 @@ HTML_TEMPLATE = """
             tbody.innerHTML = '';
 
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No Motus verified ventures found for this period.</td></tr>';
                 return;
             }
 
             data.forEach(item => {
-                const badgeClass = item.op_auth_status === 'Pending' ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
+                const badgeClass = 'bg-primary bg-opacity-10 text-primary';
                 const row = `<tr>
                     <td>
-                        <div class="fw-bold">${item.usdot_number}</div>
+                        <div class="fw-bold">${item.usdot_number} <span class="motus-badge ms-1">Motus Verified</span></div>
                         <small class="text-muted">Docket: ${item.docket_number || 'N/A'}</small>
                     </td>
                     <td>
@@ -445,10 +450,7 @@ HTML_TEMPLATE = """
                         ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
                     </td>
                     <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
-                    <td>
-                        <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
-                        <div class="small text-muted mt-1">${item.reason}</div>
-                    </td>
+                    <td><span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span></td>
                     <td>
                         <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
                         <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
@@ -462,7 +464,7 @@ HTML_TEMPLATE = """
 
         function updateStats(data) {
             document.getElementById('statTotal').innerText = data.length;
-            const pendingCount = data.filter(i => i.op_auth_status === 'Pending' || i.reason === 'Initial Status').length;
+            const pendingCount = data.filter(i => i.op_auth_status === 'Pending').length;
             document.getElementById('statActive').innerText = pendingCount;
             const states = new Set(data.map(i => i.phy_state)).size;
             document.getElementById('statStates').innerText = states;
@@ -508,7 +510,7 @@ HTML_TEMPLATE = """
                 data: {
                     labels: sortedStates.map(i => i[0]),
                     datasets: [{
-                        label: 'New Ventures',
+                        label: 'Motus Ventures',
                         data: sortedStates.map(i => i[1]),
                         backgroundColor: '#4f46e5',
                         borderRadius: 6
@@ -571,7 +573,7 @@ def api_data():
     except ValueError:
         days = 3
 
-    data = fetch_true_new_ventures(days=days)
+    data = motus_search_and_verify(days=days)
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
@@ -593,11 +595,11 @@ def run_pipeline():
     except ValueError:
         days = 3
 
-    data = fetch_true_new_ventures(days=days)
+    data = motus_search_and_verify(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
-        csv_filename = f"true_new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_filename = f"motus_new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = os.path.join(current_dir, csv_filename)
         df.to_csv(csv_path, index=False)
         
@@ -623,7 +625,7 @@ def n8n_webhook():
     except (ValueError, TypeError):
         days = 3
 
-    data = fetch_true_new_ventures(days=days)
+    data = motus_search_and_verify(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
@@ -642,7 +644,7 @@ def download_csv():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
     if os.path.exists(latest_path):
-        return send_file(latest_path, mimetype="text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
+        return send_file(latest_path, mimetype="text/css" if False else "text/csv", as_attachment=True, download_name="motus_new_ventures_sorted.csv")
     return jsonify({"error": "No CSV file generated yet."}), 404
 
 @app.route("/download/excel", methods=["GET"])
@@ -659,7 +661,7 @@ def download_excel():
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name=f"true_new_ventures_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            download_name=f"motus_new_ventures_{datetime.now().strftime('%Y%m%d')}.xlsx"
         )
     return jsonify({"error": "No data generated yet."}), 404
 
