@@ -17,7 +17,6 @@ def fetch_true_new_ventures(days=3):
     start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
     print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
     
-    # Query status changes where status is Pending or reason is Initial Status (New Entrant Program / New DOT / Authority)
     all_status_changes = []
     limit = 500
     offset = 0
@@ -43,16 +42,20 @@ def fetch_true_new_ventures(days=3):
         if len(batch) < limit:
             break
         offset += limit
-    print(f"[+] Fetched {len(all_status_changes)} status change records (Pending / Initial Status).")
+
+    print(f"[+] Fetched {len(all_status_changes)} status change records.")
     if not all_status_changes:
         return []
+
     status_map = {}
     for sc in all_status_changes:
         dot = sc.get("usdot_number")
         if dot and dot not in status_map:
             status_map[dot] = sc
+
     unique_dots = list(status_map.keys())
     print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
+
     carrier_records = []
     batch_size = 50
     for i in range(0, len(unique_dots), batch_size):
@@ -68,23 +71,22 @@ def fetch_true_new_ventures(days=3):
             carrier_records.extend(resp.json())
         except Exception as e:
             print(f"[!] Error fetching carrier batch: {e}")
-    # Build final combined dataset with strict definition:
-    # Must have add_date within the requested days window OR status_change_date within window and reason == Initial Status / Pending
+
     combined = []
     cutoff_date_str = start_date
+
     for cd in carrier_records:
         dot = cd.get("dot_number")
         sc = status_map.get(dot, {})
         add_date = cd.get("add_date", "")
         status_change_date = sc.get("status_change_date", "")
         
-        # Verify it's truly a new venture (getting their DOT or authority for the first time)
-        # add_date or status_change_date must be within the last N days
         is_recent_add = add_date and add_date >= cutoff_date_str
         is_recent_status = status_change_date and status_change_date >= cutoff_date_str
         
         if not (is_recent_add or is_recent_status):
             continue
+
         merged = {
             "usdot_number": dot,
             "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
@@ -105,9 +107,9 @@ def fetch_true_new_ventures(days=3):
             "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
         }
         combined.append(merged)
-    # Sort descending by add_date / status_change_date
+
     combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(combined)} true new ventures (Pending / Initial Status) for the last {days} days.")
+    print(f"[+] Successfully processed {len(combined)} strict new ventures for last {days} days.")
     return combined
 
 HTML_TEMPLATE = """
@@ -116,238 +118,396 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FMCSA True New Ventures Intelligence Platform</title>
+    <title>GreenSearch — FMCSA True New Ventures</title>
+    <!-- Bootstrap 5 CSS -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- FontAwesome 6 -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Google Fonts Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
-            --bs-body-font-family: 'Inter', sans-serif;
-            --sidebar-width: 260px;
-            --primary-color: #4f46e5;
-            --bg-color: #f8fafc;
+            --font-main: 'Plus Jakarta Sans', sans-serif;
+            --brand-green: #10b981;
+            --brand-green-hover: #059669;
+            --body-bg: #f8fafc;
+            --text-dark: #0f172a;
+            --text-muted: #64748b;
+            --border-color: #e2e8f0;
         }
-        body { background-color: var(--bg-color); color: #1e293b; overflow-x: hidden; }
-        .sidebar {
-            width: var(--sidebar-width);
-            height: 100vh;
-            position: fixed;
-            top: 0; left: 0;
-            background: #0f172a;
-            color: #94a3b8;
-            z-index: 1000;
-            box-shadow: 4px 0 10px rgba(0,0,0,0.05);
+
+        body {
+            font-family: var(--font-main);
+            background-color: var(--body-bg);
+            color: var(--text-dark);
+            overflow-x: hidden;
         }
-        .sidebar-brand {
-            font-size: 1.25rem; font-weight: 700; color: #fff;
-            padding: 1.5rem 1.25rem; display: flex; align-items: center; gap: 10px;
-            border-bottom: 1px solid #1e293b;
+
+        /* Navbar */
+        .navbar-green {
+            background: #ffffff;
+            border-bottom: 1px solid var(--border-color);
+            padding: 0.85rem 2rem;
         }
-        .sidebar-menu { padding: 1.25rem 0.75rem; list-style: none; margin: 0; }
-        .sidebar-menu li { margin-bottom: 0.5rem; }
-        .sidebar-menu a {
-            display: flex; align-items: center; gap: 12px;
-            padding: 10px 14px; color: #94a3b8; text-decoration: none;
-            font-weight: 500; border-radius: 8px; transition: all 0.2s ease;
+        .navbar-brand {
+            font-weight: 800;
+            font-size: 1.25rem;
+            color: var(--text-dark);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            text-decoration: none;
         }
-        .sidebar-menu a:hover, .sidebar-menu a.active {
-            background: var(--primary-color); color: #fff;
-            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
+        .navbar-brand .logo-badge {
+            background: var(--brand-green);
+            color: white;
+            width: 32px; height: 32px;
+            display: flex; align-items: center; justify-content: center;
+            border-radius: 8px;
+            font-size: 1rem;
         }
-        .main-content { margin-left: var(--sidebar-width); padding: 2.5rem; min-height: 100vh; }
+        .nav-link {
+            font-weight: 600;
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: color 0.2s;
+            cursor: pointer;
+        }
+        .nav-link:hover, .nav-link.active {
+            color: var(--brand-green);
+        }
+
+        /* Hero */
+        .hero-section {
+            background: #ffffff;
+            border-bottom: 1px solid var(--border-color);
+            padding: 2.5rem 1.5rem;
+            text-align: center;
+        }
+        .hero-title {
+            font-weight: 800;
+            font-size: 2.25rem;
+            color: var(--text-dark);
+            letter-spacing: -0.02em;
+            margin-bottom: 0.5rem;
+        }
+        .hero-subtitle {
+            color: var(--text-muted);
+            font-size: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        /* Main Container */
+        .main-container {
+            max-width: 1440px;
+            margin: 2rem auto;
+            padding: 0 1.5rem;
+        }
+
+        /* Stat Cards */
         .card-stat {
-            background: #fff; border: none; border-radius: 14px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.03); position: relative; overflow: hidden;
+            background: #ffffff;
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 1.25rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
+            position: relative;
+            overflow: hidden;
         }
-        .card-stat::after {
-            content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
-            background: var(--primary-color);
+        .card-stat::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; width: 4px; height: 100%;
+            background: var(--card-accent, var(--brand-green));
         }
-        .panel-box {
-            background: #fff; border: none; border-radius: 16px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.03); padding: 1.75rem; margin-bottom: 2rem;
+
+        /* Filters & Panels */
+        .filter-card, .panel-card {
+            background: #ffffff;
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 1.5rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
+            margin-bottom: 1.5rem;
+        }
+        .filter-title {
+            font-weight: 700;
+            font-size: 0.95rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-dark);
+            margin-bottom: 1rem;
+        }
+
+        /* Tables */
+        .table-card {
+            background: #ffffff;
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.02);
+            overflow: hidden;
+        }
+        .table-header-bar {
+            padding: 1.25rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #fff;
+        }
+        .table-custom {
+            margin-bottom: 0;
+            white-space: nowrap;
         }
         .table-custom th {
-            font-weight: 600; color: #475569; background: #f8fafc !important;
-            border-bottom: 2px solid #e2e8f0; padding: 12px 16px; white-space: nowrap;
+            font-weight: 700;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            background: #f8fafc !important;
+            border-bottom: 1px solid var(--border-color);
+            padding: 12px 16px;
         }
-        .table-custom td { padding: 14px 16px; vertical-align: middle; color: #334155; white-space: nowrap; }
-        .table-container { max-height: 650px; overflow-y: auto; border-radius: 12px; border: 1px solid #e2e8f0; }
+        .table-custom td {
+            padding: 14px 16px;
+            vertical-align: middle;
+            color: var(--text-dark);
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.9rem;
+        }
+        .table-container {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+
+        /* Badges */
+        .status-badge {
+            font-weight: 700;
+            font-size: 0.7rem;
+            padding: 5px 10px;
+            border-radius: 6px;
+            letter-spacing: 0.05em;
+        }
+        .badge-active { background: rgba(16, 185, 129, 0.15); color: #059669; }
+        .badge-pending { background: rgba(245, 158, 11, 0.15); color: #d97706; }
+
+        .btn-green {
+            background: var(--brand-green);
+            color: #fff;
+            border: none;
+            font-weight: 600;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+        .btn-green:hover {
+            background: var(--brand-green-hover);
+            color: #fff;
+        }
+
         #loadingOverlay {
-            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(255, 255, 255, 0.85); z-index: 9999;
-            justify-content: center; align-items: center; flex-direction: column; gap: 15px;
-        }
-        .badge-status { padding: 6px 12px; border-radius: 20px; font-weight: 500; font-size: 0.75rem; }
-        @media (max-width: 992px) {
-            .sidebar { width: 70px; }
-            .sidebar .sidebar-brand span, .sidebar .sidebar-menu span, .sidebar .sidebar-footer { display: none; }
-            .main-content { margin-left: 70px; padding: 1.5rem; }
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(4px);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            gap: 15px;
+            color: #fff;
         }
     </style>
 </head>
 <body>
+
+    <!-- Loading Overlay -->
     <div id="loadingOverlay">
-        <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
-        <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
-        <p class="text-muted small">Fetching newly issued USDOTs and Initial Status authorities...</p>
+        <div class="spinner-border text-light" style="width: 3.5rem; height: 3.5rem;" role="status"></div>
+        <h4 class="fw-bold mt-3">Loading New Ventures...</h4>
+        <p class="text-light opacity-75 small">Connecting to FMCSA live registry database...</p>
     </div>
-    <div class="sidebar d-flex flex-column justify-content-between">
-        <div>
-            <div class="sidebar-brand">
-                <i class="fa-solid fa-truck-fast text-indigo" style="color: #6366f1;"></i>
-                <span>NewVentures</span>
-            </div>
-            <ul class="sidebar-menu">
-                <li><a href="#" class="active" onclick="switchTab('dashboard', event)"><i class="fa-solid fa-chart-pie fa-fw"></i> <span>Dashboard</span></a></li>
-                <li><a href="#" onclick="switchTab('analytics', event)"><i class="fa-solid fa-chart-column fa-fw"></i> <span>Analytics</span></a></li>
-                <li><a href="#" onclick="switchTab('webhook', event)"><i class="fa-solid fa-bolt fa-fw"></i> <span>n8n Webhooks</span></a></li>
-                <li><a href="/download/csv" target="_blank"><i class="fa-solid fa-file-csv fa-fw"></i> <span>Export CSV</span></a></li>
-                <li><a href="/download/excel" target="_blank"><i class="fa-solid fa-file-excel fa-fw"></i> <span>Export Excel</span></a></li>
-            </ul>
-        </div>
-        <div class="p-3 m-3 rounded bg-dark border border-secondary text-center sidebar-footer">
-            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> New Entrant Verified</small>
-        </div>
-    </div>
-    <div class="main-content">
-        
-        <div id="tab-dashboard" class="tab-pane">
-            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
-                <div>
-                    <h2 class="fw-bold mb-1">True New Ventures (New Entrant Program)</h2>
-                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time.</p>
-                </div>
-                <div class="d-flex align-items-center gap-2">
-                    <select id="daysSelect" class="form-select shadow-sm" style="width: 150px;">
-                        <option value="1">Last 1 Day</option>
-                        <option value="3" selected>Last 3 Days</option>
-                        <option value="7">Last 7 Days</option>
-                        <option value="14">Last 14 Days</option>
-                        <option value="30">Last 30 Days</option>
-                    </select>
-                    <button class="btn btn-primary shadow-sm px-4 d-flex align-items-center gap-2" onclick="loadData()" style="background-color: var(--primary-color); border: none;">
-                        <i class="fa-solid fa-rotate"></i> Refresh
-                    </button>
-                </div>
-            </div>
 
-            <div class="row g-4 mb-4">
+    <!-- Top Navbar -->
+    <nav class="navbar navbar-green navbar-expand-lg">
+        <div class="container-fluid px-3">
+            <a class="navbar-brand" href="#">
+                <div class="logo-badge"><i class="fa-solid fa-bolt"></i></div>
+                <span>GreenSearch</span>
+            </a>
+            <div class="d-flex align-items-center gap-4">
+                <a href="#" class="nav-link active" onclick="switchTab('dashboard', event)">Dashboard</a>
+                <a href="#" class="nav-link" onclick="switchTab('analytics', event)">Analytics</a>
+                <a href="#" class="nav-link" onclick="switchTab('webhook', event)">API / Webhook</a>
+                <a href="/download/excel" class="btn btn-green btn-sm"><i class="fa-solid fa-file-excel me-1"></i> Export Excel</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Header -->
+    <section class="hero-section">
+        <div class="container">
+            <h1 class="hero-title">Look up any FMCSA new venture</h1>
+            <p class="hero-subtitle">Free, public motor-carrier data — search by name, DOT#, MC#, location, cargo, or contact.</p>
+        </div>
+    </section>
+
+    <!-- Main Container Layout -->
+    <div class="main-container">
+
+        <!-- DASHBOARD TAB -->
+        <div id="tab-dashboard">
+            <!-- Stats Row -->
+            <div class="row g-3 mb-4">
                 <div class="col-md-3">
-                    <div class="card card-stat p-4">
-                        <span class="text-muted small fw-semibold text-uppercase">New Entrants</span>
-                        <h2 id="statTotal" class="fw-bold mt-2 mb-0 text-dark">0</h2>
+                    <div class="card card-stat" style="--card-accent: #10b981;">
+                        <span class="text-muted small fw-bold text-uppercase">Total New Ventures</span>
+                        <h3 id="statTotal" class="fw-bold mt-1 mb-0 text-dark">0</h3>
                     </div>
                 </div>
                 <div class="col-md-3">
-                    <div class="card card-stat p-4" style="--primary-color: #10b981;">
-                        <span class="text-muted small fw-semibold text-uppercase">Pending / Initial</span>
-                        <h2 id="statActive" class="fw-bold mt-2 mb-0 text-success">0</h2>
+                    <div class="card card-stat" style="--card-accent: #f59e0b;">
+                        <span class="text-muted small fw-bold text-uppercase">Pending Authorities</span>
+                        <h3 id="statPending" class="fw-bold mt-1 mb-0 text-warning">0</h3>
                     </div>
                 </div>
                 <div class="col-md-3">
-                    <div class="card card-stat p-4" style="--primary-color: #0ea5e9;">
-                        <span class="text-muted small fw-semibold text-uppercase">States Covered</span>
-                        <h2 id="statStates" class="fw-bold mt-2 mb-0 text-info">0</h2>
+                    <div class="card card-stat" style="--card-accent: #0ea5e9;">
+                        <span class="text-muted small fw-bold text-uppercase">States Covered</span>
+                        <h3 id="statStates" class="fw-bold mt-1 mb-0 text-info">0</h3>
                     </div>
                 </div>
                 <div class="col-md-3">
-                    <div class="card card-stat p-4" style="--primary-color: #f59e0b;">
-                        <span class="text-muted small fw-semibold text-uppercase">Total Power Units</span>
-                        <h2 id="statUnits" class="fw-bold mt-2 mb-0 text-warning">0</h2>
+                    <div class="card card-stat" style="--card-accent: #6366f1;">
+                        <span class="text-muted small fw-bold text-uppercase">Total Power Units</span>
+                        <h3 id="statUnits" class="fw-bold mt-1 mb-0 text-primary">0</h3>
                     </div>
                 </div>
             </div>
 
-            <div class="panel-box">
-                <div class="row g-3 mb-4">
-                    <div class="col-md-6">
-                        <div class="input-group shadow-sm">
-                            <span class="input-group-text bg-white border-end-0"><i class="fa-solid fa-search text-muted"></i></span>
-                            <input type="text" id="searchInput" class="form-control border-start-0" placeholder="Search company name, USDOT, city, email..." onkeyup="filterTable()">
+            <div class="row g-4">
+                <!-- Filters Sidebar -->
+                <div class="col-lg-3">
+                    <div class="filter-card">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <span class="filter-title mb-0">Filters</span>
+                            <a href="#" class="text-success text-decoration-none small fw-semibold" onclick="resetFilters()">Reset all</a>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">Timeframe</label>
+                            <select id="daysSelect" class="form-select form-select-sm" onchange="loadData()">
+                                <option value="1">Last 1 Day</option>
+                                <option value="3" selected>Last 3 Days</option>
+                                <option value="7">Last 7 Days</option>
+                                <option value="14">Last 14 Days</option>
+                                <option value="30">Last 30 Days</option>
+                            </select>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">State</label>
+                            <select id="stateFilter" class="form-select form-select-sm" onchange="filterTable()">
+                                <option value="">All States</option>
+                            </select>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label small fw-bold text-muted">Status</label>
+                            <select id="statusFilter" class="form-select form-select-sm" onchange="filterTable()">
+                                <option value="">All Statuses</option>
+                                <option value="Active">Active</option>
+                                <option value="Pending">Pending</option>
+                            </select>
                         </div>
                     </div>
-                    <div class="col-md-3">
-                        <select id="stateFilter" class="form-select shadow-sm" onchange="filterTable()">
-                            <option value="">All States</option>
-                        </select>
-                    </div>
-                    <div class="col-md-3">
-                        <select id="statusFilter" class="form-select shadow-sm" onchange="filterTable()">
-                            <option value="">All Statuses</option>
-                            <option value="Pending">Pending / Initial</option>
-                            <option value="Active">Active</option>
-                        </select>
-                    </div>
                 </div>
 
-                <div class="table-container">
-                    <table class="table table-hover align-middle table-custom mb-0" id="venturesTable">
-                        <thead class="sticky-top">
-                            <tr>
-                                <th>USDOT / Docket</th>
-                                <th>Company Name</th>
-                                <th>Entry Date</th>
-                                <th>Status / Reason</th>
-                                <th>Contact Information</th>
-                                <th>Location</th>
-                                <th>Power Units</th>
-                            </tr>
-                        </thead>
-                        <tbody id="tableBody">
-                        </tbody>
-                    </table>
+                <!-- Data Table Area -->
+                <div class="col-lg-9">
+                    <div class="table-card">
+                        <div class="table-header-bar">
+                            <div class="w-50">
+                                <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search company name, USDOT, city, email..." onkeyup="filterTable()">
+                            </div>
+                            <div class="d-flex gap-2">
+                                <span id="resultCount" class="text-muted small fw-semibold align-self-center me-2">Showing 0 results</span>
+                                <a href="/download/csv" class="btn btn-outline-secondary btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
+                                <a href="/download/excel" class="btn btn-outline-success btn-sm" target="_blank"><i class="fa-solid fa-file-excel me-1"></i> Export Excel</a>
+                            </div>
+                        </div>
+
+                        <div class="table-container">
+                            <table class="table table-hover align-middle table-custom" id="venturesTable">
+                                <thead class="sticky-top">
+                                    <tr>
+                                        <th>Carrier</th>
+                                        <th>DOT #</th>
+                                        <th>MC#</th>
+                                        <th>Location</th>
+                                        <th>Power Units</th>
+                                        <th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tableBody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
 
+        <!-- ANALYTICS TAB -->
         <div id="tab-analytics" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">New Ventures Analytics & Insights</h2>
             <div class="row g-4">
                 <div class="col-lg-6">
-                    <div class="panel-box">
-                        <h5 class="fw-bold mb-3">Top 10 States for New Registrations</h5>
+                    <div class="panel-card">
+                        <h5 class="fw-bold mb-3">Top 10 States for New Ventures</h5>
                         <canvas id="stateChart" height="250"></canvas>
                     </div>
                 </div>
                 <div class="col-lg-6">
-                    <div class="panel-box">
-                        <h5 class="fw-bold mb-3">Registration Volume by Date</h5>
+                    <div class="panel-card">
+                        <h5 class="fw-bold mb-3">Registration Volume Over Time</h5>
                         <canvas id="dateChart" height="250"></canvas>
                     </div>
                 </div>
             </div>
         </div>
 
+        <!-- WEBHOOK TAB -->
         <div id="tab-webhook" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">n8n Automation & Webhook Integration</h2>
-            <div class="panel-box">
-                <h4 class="fw-bold text-indigo mb-3" style="color: var(--primary-color);"><i class="fa-solid fa-link me-2"></i> Platform Endpoints</h4>
-                <p class="text-muted mb-4">Connect these endpoints into n8n or automated scripts to fetch verified new ventures and export data automatically.</p>
+            <div class="panel-card">
+                <h4 class="fw-bold text-success mb-3"><i class="fa-solid fa-link me-2"></i> n8n Webhook & API Endpoints</h4>
+                <p class="text-muted mb-4">Use these endpoints to integrate your GreenSearch platform into n8n or automated scripts.</p>
                 
                 <div class="mb-4">
-                    <label class="form-label fw-bold">Webhook URL (POST / GET)</label>
+                    <label class="form-label fw-bold small">Webhook URL (POST / GET)</label>
                     <div class="input-group shadow-sm">
                         <input type="text" class="form-control font-monospace bg-light" id="webhookUrl" value="" readonly>
-                        <button class="btn btn-outline-primary" onclick="copyText('webhookUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
+                        <button class="btn btn-outline-success" onclick="copyText('webhookUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
                     <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 3 }</code></small>
                 </div>
 
                 <div class="mb-4">
-                    <label class="form-label fw-bold">Direct CSV Download URL</label>
+                    <label class="form-label fw-bold small">Direct CSV Download URL</label>
                     <div class="input-group shadow-sm">
                         <input type="text" class="form-control font-monospace bg-light" id="csvUrl" value="" readonly>
-                        <button class="btn btn-outline-primary" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
+                        <button class="btn btn-outline-success" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
                 </div>
 
                 <div class="mb-3">
-                    <label class="form-label fw-bold">Direct Excel Download URL</label>
+                    <label class="form-label fw-bold small">Direct Excel Download URL</label>
                     <div class="input-group shadow-sm">
                         <input type="text" class="form-control font-monospace bg-light" id="excelUrl" value="" readonly>
-                        <button class="btn btn-outline-primary" onclick="copyText('excelUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
+                        <button class="btn btn-outline-success" onclick="copyText('excelUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
                 </div>
             </div>
@@ -355,6 +515,7 @@ HTML_TEMPLATE = """
 
     </div>
 
+    <!-- Bootstrap JS & Charts -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let allData = [];
@@ -367,7 +528,7 @@ HTML_TEMPLATE = """
 
         function switchTab(tabName, event) {
             if (event) event.preventDefault();
-            document.querySelectorAll('.sidebar-menu a').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
             if (event && event.currentTarget) event.currentTarget.classList.add('active');
 
             document.getElementById('tab-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
@@ -417,33 +578,26 @@ HTML_TEMPLATE = """
             const tbody = document.getElementById('tableBody');
             tbody.innerHTML = '';
 
+            document.getElementById('resultCount').innerText = `Showing ${data.length} results`;
+
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-5">No new ventures found for this period.</td></tr>';
                 return;
             }
 
             data.forEach(item => {
-                const badgeClass = item.op_auth_status === 'Pending' ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
+                const statusClass = item.op_auth_status === 'Active' ? 'badge-active' : 'badge-pending';
                 const row = `<tr>
                     <td>
-                        <div class="fw-bold">${item.usdot_number}</div>
-                        <small class="text-muted">Docket: ${item.docket_number || 'N/A'}</small>
-                    </td>
-                    <td>
                         <div class="fw-bold text-dark">${item.legal_name}</div>
-                        ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
+                        ${item.dba_name && item.dba_name !== '—' ? `<small class="text-muted">d/b/a ${item.dba_name}</small>` : ''}
+                        <div><span class="badge bg-light text-secondary border font-monospace" style="font-size:0.65rem;">${item.add_date}</span></div>
                     </td>
-                    <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
-                    <td>
-                        <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
-                        <div class="small text-muted mt-1">${item.reason}</div>
-                    </td>
-                    <td>
-                        <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
-                        <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
-                    </td>
-                    <td>${item.phy_city}, ${item.phy_state} ${item.phy_zip}</td>
-                    <td><span class="badge bg-dark bg-opacity-10 text-dark px-3 py-2">${item.power_units} Units</span></td>
+                    <td><span class="font-monospace fw-bold">${item.usdot_number}</span></td>
+                    <td><span class="font-monospace">${item.docket_number}</span></td>
+                    <td>${item.phy_city}, ${item.phy_state}</td>
+                    <td><span class="fw-semibold">${item.power_units}</span></td>
+                    <td><span class="status-badge ${statusClass}">${item.op_auth_status}</span></td>
                 </tr>`;
                 tbody.innerHTML += row;
             });
@@ -451,8 +605,8 @@ HTML_TEMPLATE = """
 
         function updateStats(data) {
             document.getElementById('statTotal').innerText = data.length;
-            const pendingCount = data.filter(i => i.op_auth_status === 'Pending' || i.reason === 'Initial Status').length;
-            document.getElementById('statActive').innerText = pendingCount;
+            const pendingCount = data.filter(i => i.op_auth_status === 'Pending').length;
+            document.getElementById('statPending').innerText = pendingCount;
             const states = new Set(data.map(i => i.phy_state)).size;
             document.getElementById('statStates').innerText = states;
             const totalUnits = data.reduce((acc, curr) => acc + (parseInt(curr.power_units) || 0), 0);
@@ -468,6 +622,7 @@ HTML_TEMPLATE = """
                 const matchesQuery = (
                     (item.legal_name && item.legal_name.toLowerCase().includes(query)) ||
                     (item.usdot_number && item.usdot_number.toLowerCase().includes(query)) ||
+                    (item.docket_number && item.docket_number.toLowerCase().includes(query)) ||
                     (item.phy_city && item.phy_city.toLowerCase().includes(query)) ||
                     (item.phy_state && item.phy_state.toLowerCase().includes(query)) ||
                     (item.email_address && item.email_address.toLowerCase().includes(query))
@@ -477,6 +632,14 @@ HTML_TEMPLATE = """
                 return matchesQuery && matchesState && matchesStatus;
             });
             renderTable(filtered);
+        }
+
+        function resetFilters() {
+            document.getElementById('searchInput').value = '';
+            document.getElementById('stateFilter').value = '';
+            document.getElementById('statusFilter').value = '';
+            document.getElementById('daysSelect').value = '3';
+            loadData();
         }
 
         function renderCharts() {
@@ -499,7 +662,7 @@ HTML_TEMPLATE = """
                     datasets: [{
                         label: 'New Ventures',
                         data: sortedStates.map(i => i[1]),
-                        backgroundColor: '#4f46e5',
+                        backgroundColor: '#10b981',
                         borderRadius: 6
                     }]
                 },
@@ -523,8 +686,8 @@ HTML_TEMPLATE = """
                     datasets: [{
                         label: 'Registrations',
                         data: sortedDates.map(i => i[1]),
-                        borderColor: '#06b6d4',
-                        backgroundColor: 'rgba(6, 182, 212, 0.1)',
+                        borderColor: '#10b981',
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
                         fill: true,
                         tension: 0.3,
                         pointRadius: 4
@@ -586,7 +749,7 @@ def run_pipeline():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
-        csv_filename = f"true_new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_filename = f"new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = os.path.join(current_dir, csv_filename)
         df.to_csv(csv_path, index=False)
         
