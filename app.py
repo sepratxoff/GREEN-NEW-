@@ -31,8 +31,9 @@ _cache      = {}
 _cache_lock = threading.Lock()
 
 
-def get_cached_ventures(days: int):
-    key = f"ventures_{days}"
+def get_cached_ventures(days: int, only_pending: bool = True):
+    """Cache key now includes the pending flag so both variants are cached separately."""
+    key = f"ventures_{days}_{only_pending}"
     now = datetime.now()
 
     with _cache_lock:
@@ -42,7 +43,7 @@ def get_cached_ventures(days: int):
                 print(f"[cache hit] key={key}  age={(now - cached_at).total_seconds():.0f}s")
                 return data
 
-    data = fetch_true_new_ventures(days=days)
+    data = fetch_true_new_ventures(days=days, only_pending=only_pending)
 
     with _cache_lock:
         _cache[key] = (data, now)
@@ -116,37 +117,38 @@ def api_error(message, status=500, details=None):
 
 
 # ─────────────────────────────────────────────
-# STEP 1 — FETCH STATUS CHANGES  (dm5j-zc6c)
+# STEP 1 — QUERY MASTER REGISTRY FIRST  (az4n-8mr2)
 # ─────────────────────────────────────────────
-def fetch_status_changes(session: requests.Session, days: int) -> list:
+def fetch_new_carriers_by_add_date(session: requests.Session, days: int) -> list:
     """
-    Pull every status-change event from dm5j-zc6c that falls within
-    the requested window AND represents an initial / pending filing.
-    Paginates automatically until the full result set is collected.
+    Query az4n-8mr2 DIRECTLY for carriers whose master registration
+    (add_date) falls within the requested window.
+
+    This is the ONLY reliable source of truly-new USDOT numbers.
+    Starting here (instead of status changes) ensures we do NOT miss
+    the ~90 % of new carriers who never file an MC docket in the same
+    30-day window.
     """
     iso_start = iso_cutoff(days)
     all_rows  = []
-    limit     = 500
+    limit     = 1000                    # az4n-8mr2 supports up to 50 000/call
     offset    = 0
 
-    print(f"[*] STATUS CHANGES — fetching from {iso_start}  (last {days} days)")
+    print(f"[*] MASTER REGISTRY — fetching add_date >= {iso_start}  (last {days} days)")
 
     while True:
         params = {
-            "$where" : (
-                f"status_change_date >= '{iso_start}' "
-                f"AND (op_auth_status = 'Pending' OR reason = 'Initial Status')"
-            ),
+            "$where" : f"add_date >= '{iso_start}'",
             "$limit" : limit,
             "$offset": offset,
-            "$order" : "status_change_date DESC",
+            "$order" : "add_date DESC",
         }
         try:
-            resp = session.get(STATUS_CHANGE_URL, params=params, timeout=30)
+            resp = session.get(CARRIER_INFO_URL, params=params, timeout=60)
             resp.raise_for_status()
             batch = resp.json()
         except Exception as exc:
-            print(f"[!] Status-change fetch error (offset={offset}): {exc}")
+            print(f"[!] Master registry error (offset={offset}): {exc}")
             break
 
         if not batch:
@@ -157,94 +159,74 @@ def fetch_status_changes(session: requests.Session, days: int) -> list:
 
         if len(batch) < limit:
             break
-
         offset += limit
 
-    print(f"[+] STATUS CHANGES total: {len(all_rows)}")
+    print(f"[+] MASTER REGISTRY new registrations: {len(all_rows)}")
     return all_rows
 
 
 # ─────────────────────────────────────────────
-# STEP 2 — DEDUPLICATE BY DOT
+# STEP 2 — ENRICH WITH STATUS-CHANGE DATA  (dm5j-zc6c)
 # ─────────────────────────────────────────────
-def build_status_map(status_rows: list) -> dict:
+def _fetch_status_batch(session: requests.Session, batch: list) -> list:
+    """Fetch status-change rows for one batch of DOT numbers."""
+    dots_str = ",".join(f"'{d}'" for d in batch)
+    params   = {
+        "$where": f"usdot_number in ({dots_str})",
+        "$limit": len(batch) * 5,       # each DOT may have multiple events
+        "$order": "status_change_date DESC",
+    }
+    try:
+        resp = session.get(STATUS_CHANGE_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:
+        print(f"[!] Status enrichment batch error: {exc}")
+        return []
+
+
+def fetch_status_for_dots(session: requests.Session, dots: list) -> dict:
     """
-    Keep only the most-recent status-change event per DOT number.
-    Because rows arrive DESC-ordered the first occurrence per DOT
-    is always the newest.
+    Look up status-change events for every new DOT so we can classify
+    operating-authority state (Pending / Active).  Returns a dict keyed
+    by USDOT → most recent status row.
     """
+    if not dots:
+        return {}
+
+    print(f"[*] STATUS CHANGES — enriching {len(dots)} new DOTs  (parallel)")
+
     status_map = {}
-    for sc in status_rows:
-        dot = sc.get("usdot_number")
-        if dot and dot not in status_map:
-            status_map[dot] = sc
-    print(f"[*] Unique DOTs after dedup: {len(status_map)}")
+    batches    = [dots[i : i + BATCH_SIZE] for i in range(0, len(dots), BATCH_SIZE)]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = [pool.submit(_fetch_status_batch, session, b) for b in batches]
+        for fut in as_completed(futures):
+            for row in fut.result():
+                dot = row.get("usdot_number")
+                if dot and dot not in status_map:      # DESC order → newest first
+                    status_map[dot] = row
+
+    print(f"[+] STATUS CHANGES matched for {len(status_map)} DOTs")
     return status_map
 
 
 # ─────────────────────────────────────────────
-# STEP 3 — FETCH CARRIER PROFILES  (az4n-8mr2)
+# STEP 3 — MERGE + APPLY BUSINESS RULES
 # ─────────────────────────────────────────────
-def fetch_one_carrier_batch(session: requests.Session, dots: list) -> list:
-    """Fetch master-registry records for one batch of DOT numbers."""
-    dots_str = ",".join(f"'{d}'" for d in dots)
-    params   = {
-        "$where": f"dot_number in ({dots_str})",
-        "$limit": len(dots) + 10,          # safety buffer above batch size
-    }
-    try:
-        resp = session.get(CARRIER_INFO_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:
-        print(f"[!] Carrier batch error: {exc}")
-        return []
-
-
-def fetch_all_carrier_profiles(session: requests.Session, unique_dots: list) -> list:
-    """
-    Split unique DOTs into batches and fetch all carrier master profiles
-    in parallel using a thread pool — significantly faster than sequential.
-    """
-    batches = [
-        unique_dots[i : i + BATCH_SIZE]
-        for i in range(0, len(unique_dots), BATCH_SIZE)
-    ]
-    results = []
-
-    print(f"[*] CARRIER PROFILES — {len(unique_dots)} DOTs in {len(batches)} batches  (parallel)")
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(fetch_one_carrier_batch, session, batch): batch
-            for batch in batches
-        }
-        for fut in as_completed(futures):
-            batch_result = fut.result()
-            results.extend(batch_result)
-
-    print(f"[+] CARRIER PROFILES total returned: {len(results)}")
-    return results
-
-
-# ─────────────────────────────────────────────
-# STEP 4 — MERGE + STRICT add_date FILTER
-# ─────────────────────────────────────────────
-def merge_and_filter(
-    carrier_rows: list,
-    status_map  : dict,
-    cutoff_str  : str,
+def merge_new_ventures(
+    carrier_rows : list,
+    status_map   : dict,
+    only_pending : bool = True,
 ) -> list:
     """
-    Join carrier master data with the matching status-change event,
-    then apply the CORE BUSINESS RULE:
+    Combine master registry + status change into unified rows.
 
-        add_date >= cutoff_str
-
-    This single condition is what eliminates reinstated carriers,
-    holding-company secondary filings, and all other false positives.
-    Only entities whose PRIMARY registration date falls inside the
-    requested window survive.
+    Business rules:
+      • add_date filter is already applied upstream (in the query itself)
+      • If only_pending=True → keep only carriers whose Operating Authority
+        is Pending (matches the New-Entrant + Pending-MC use case from
+        the screenshots).
     """
     combined = []
 
@@ -252,45 +234,43 @@ def merge_and_filter(
         dot           = cd.get("dot_number")
         sc            = status_map.get(dot, {})
         add_date_raw  = cd.get("add_date", "")
-        add_date_norm = normalize_date(add_date_raw)   # always YYYYMMDD or ''
+        add_date_norm = normalize_date(add_date_raw)
 
-        # ── CORE BUSINESS RULE ─────────────────────────────────────────────
-        # Reject any carrier whose primary registration predates the window.
-        if not add_date_norm or add_date_norm < cutoff_str:
+        # Resolve authority status
+        op_status_raw = (
+            sc.get("op_auth_status")
+            or ("ACTIVE" if cd.get("status_code") == "A" else "PENDING")
+        ).upper()
+
+        # Optional strict filter — matches the screenshots
+        if only_pending and op_status_raw != "PENDING":
             continue
-        # ──────────────────────────────────────────────────────────────────
-
-        # Resolve op_auth_status — prefer status-change record, fall back to
-        # master-registry status_code so every row always has a value.
-        raw_status = sc.get("op_auth_status") or (
-            "ACTIVE" if cd.get("status_code") == "A" else "PENDING"
-        )
 
         combined.append({
-            # ── identifiers ────────────────────────────────────────────────
+            # ── identifiers ────────────────────────────────────────────
             "usdot_number"      : dot or "—",
             "docket_number"     : sc.get("docket_number") or cd.get("docket1") or "—",
-            # ── names ──────────────────────────────────────────────────────
+            # ── names ──────────────────────────────────────────────────
             "legal_name"        : cd.get("legal_name")   or "—",
             "dba_name"          : cd.get("dba_name")     or "—",
-            # ── dates ──────────────────────────────────────────────────────
+            # ── dates ──────────────────────────────────────────────────
             "add_date"          : add_date_norm,
             "status_change_date": normalize_date(
                                       sc.get("status_change_date") or add_date_raw
                                   ) or add_date_norm,
-            # ── authority ──────────────────────────────────────────────────
-            "op_auth_status"    : raw_status.upper(),
-            "reason"            : sc.get("reason")        or "Initial Status",
+            # ── authority ──────────────────────────────────────────────
+            "op_auth_status"    : op_status_raw,
+            "reason"            : sc.get("reason")        or "New Entrant",
             "op_auth_type"      : sc.get("op_auth_type")  or "Motor Carrier of Property",
-            # ── contact ────────────────────────────────────────────────────
+            # ── contact ────────────────────────────────────────────────
             "phone"             : cd.get("phone") or cd.get("cell_phone") or "—",
             "email_address"     : cd.get("email_address") or "—",
-            # ── address ────────────────────────────────────────────────────
+            # ── address ────────────────────────────────────────────────
             "phy_street"        : cd.get("phy_street")    or "—",
             "phy_city"          : cd.get("phy_city")      or "—",
             "phy_state"         : cd.get("phy_state")     or "—",
             "phy_zip"           : cd.get("phy_zip")       or "—",
-            # ── fleet ──────────────────────────────────────────────────────
+            # ── fleet ──────────────────────────────────────────────────
             "power_units"       : int(cd.get("power_units") or 1),
             "classdef"          : cd.get("classdef")      or "AUTHORIZED FOR HIRE",
         })
@@ -300,36 +280,37 @@ def merge_and_filter(
 
 
 # ─────────────────────────────────────────────
-# MAIN PIPELINE ORCHESTRATOR
+# MAIN PIPELINE  (correct inverted order)
 # ─────────────────────────────────────────────
-def fetch_true_new_ventures(days: int = 3) -> list:
+def fetch_true_new_ventures(days: int = 3, only_pending: bool = True) -> list:
     """
-    Full four-step pipeline:
-      1. Fetch status-change events  (dm5j-zc6c)
-      2. Deduplicate by DOT number
-      3. Fetch carrier master profiles in parallel  (az4n-8mr2)
-      4. Merge + apply strict add_date filter → sort DESC
-    """
-    session    = create_session()
-    cutoff_str = yyyymmdd_cutoff(days)
+    CORRECTED four-step pipeline:
 
-    # Step 1 — status changes
-    status_rows = fetch_status_changes(session, days)
-    if not status_rows:
-        print("[!] No status-change rows returned — aborting pipeline.")
+      1. Query az4n-8mr2 for every carrier whose add_date is in the window
+      2. Enrich each DOT with its latest dm5j-zc6c status-change event
+      3. Optionally keep only carriers with Pending Operating Authority
+         (matches the New-Entrant Program + Pending MC combination)
+      4. Sort DESC by registration date
+    """
+    session = create_session()
+
+    # Step 1 — direct pull of new registrations
+    carrier_rows = fetch_new_carriers_by_add_date(session, days)
+    if not carrier_rows:
+        print("[!] No new carriers in master registry — aborting.")
         return []
 
-    # Step 2 — deduplicate
-    status_map  = build_status_map(status_rows)
-    unique_dots = list(status_map.keys())
+    # Step 2 — enrich with status data
+    unique_dots = [c.get("dot_number") for c in carrier_rows if c.get("dot_number")]
+    status_map  = fetch_status_for_dots(session, unique_dots)
 
-    # Step 3 — carrier master profiles
-    carrier_rows = fetch_all_carrier_profiles(session, unique_dots)
+    # Step 3 — merge + optional pending-only filter
+    results = merge_new_ventures(carrier_rows, status_map, only_pending=only_pending)
 
-    # Step 4 — merge + filter
-    results = merge_and_filter(carrier_rows, status_map, cutoff_str)
-
-    print(f"[+] TRUE NEW VENTURES (add_date >= {cutoff_str}): {len(results)}")
+    print(
+        f"[+] TRUE NEW VENTURES: {len(results)}  "
+        f"(pending_only={only_pending}, window={days} days)"
+    )
     return results
 
 
@@ -384,8 +365,6 @@ HTML_TEMPLATE = """
             color           : var(--text-dark);
             overflow-x      : hidden;
         }
-
-        /* ── Navbar ── */
         .navbar-green {
             background   : #ffffff;
             border-bottom: 1px solid var(--border-color);
@@ -420,8 +399,6 @@ HTML_TEMPLATE = """
         }
         .nav-link:hover,
         .nav-link.active { color: var(--brand-green); }
-
-        /* ── Hero ── */
         .hero-section {
             background   : #ffffff;
             border-bottom: 1px solid var(--border-color);
@@ -440,15 +417,11 @@ HTML_TEMPLATE = """
             font-size    : 1rem;
             margin-bottom: 1.5rem;
         }
-
-        /* ── Layout ── */
         .main-container {
             max-width: 1440px;
             margin   : 2rem auto;
             padding  : 0 1.5rem;
         }
-
-        /* ── Filter card ── */
         .filter-card {
             background   : #ffffff;
             border       : 1px solid var(--border-color);
@@ -463,8 +436,6 @@ HTML_TEMPLATE = """
             letter-spacing: 0.05em;
             color         : var(--text-dark);
         }
-
-        /* ── Table card ── */
         .table-card {
             background   : #ffffff;
             border       : 1px solid var(--border-color);
@@ -502,8 +473,6 @@ HTML_TEMPLATE = """
             max-height: 600px;
             overflow-y: auto;
         }
-
-        /* ── Badges ── */
         .status-badge {
             font-weight   : 700;
             font-size     : 0.7rem;
@@ -513,8 +482,6 @@ HTML_TEMPLATE = """
         }
         .badge-active  { background: rgba(16,185,129,0.15); color: #059669; }
         .badge-pending { background: rgba(245,158,11,0.15);  color: #d97706; }
-
-        /* ── Buttons ── */
         .btn-green {
             background   : var(--brand-green);
             color        : #fff;
@@ -525,8 +492,6 @@ HTML_TEMPLATE = """
             transition   : background 0.2s;
         }
         .btn-green:hover { background: var(--brand-green-hover); color: #fff; }
-
-        /* ── Loading overlay ── */
         #loadingOverlay {
             display        : none;
             position       : fixed;
@@ -540,20 +505,17 @@ HTML_TEMPLATE = """
             gap            : 15px;
             color          : #fff;
         }
-
         .toast-container { z-index: 11000; }
     </style>
 </head>
 <body>
 
-<!-- Loading Overlay -->
 <div id="loadingOverlay">
     <div class="spinner-border text-light" style="width:3.5rem;height:3.5rem;" role="status"></div>
     <h4 class="fw-bold mt-3">Loading New Ventures…</h4>
-    <p class="text-light opacity-75 small">Querying FMCSA status-change + carrier registry…</p>
+    <p class="text-light opacity-75 small">Querying FMCSA master registry + status data…</p>
 </div>
 
-<!-- Toast -->
 <div class="toast-container position-fixed bottom-0 end-0 p-3">
     <div id="appToast" class="toast align-items-center text-bg-success border-0" role="alert">
         <div class="d-flex">
@@ -564,7 +526,6 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
-<!-- Navbar -->
 <nav class="navbar navbar-green navbar-expand-lg">
     <div class="container-fluid px-3">
         <a class="navbar-brand" href="#">
@@ -583,7 +544,6 @@ HTML_TEMPLATE = """
     </div>
 </nav>
 
-<!-- Hero -->
 <section class="hero-section">
     <div class="container">
         <h1 class="hero-title">Look up any FMCSA new venture</h1>
@@ -593,10 +553,9 @@ HTML_TEMPLATE = """
     </div>
 </section>
 
-<!-- Main -->
 <div class="main-container">
 
-    <!-- ── DASHBOARD TAB ── -->
+    <!-- DASHBOARD TAB -->
     <div id="tab-dashboard">
         <div class="row g-4">
 
@@ -622,6 +581,15 @@ HTML_TEMPLATE = """
                     </div>
 
                     <div class="mb-3">
+                        <label class="form-label small fw-bold text-muted">Authority Filter</label>
+                        <select id="pendingFilter" class="form-select form-select-sm"
+                                onchange="loadData()">
+                            <option value="true" selected>Pending Only (New Entrants)</option>
+                            <option value="false">All New Registrations</option>
+                        </select>
+                    </div>
+
+                    <div class="mb-3">
                         <label class="form-label small fw-bold text-muted">State</label>
                         <select id="stateFilter" class="form-select form-select-sm"
                                 onchange="filterTable()">
@@ -639,7 +607,6 @@ HTML_TEMPLATE = """
                         </select>
                     </div>
 
-                    <!-- Quick Stats -->
                     <div id="statsBox" class="mt-3 pt-3 border-top d-none">
                         <div class="small text-muted fw-semibold mb-2">QUICK STATS</div>
                         <div class="d-flex justify-content-between small mb-1">
@@ -697,9 +664,9 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
-    </div><!-- /tab-dashboard -->
+    </div>
 
-    <!-- ── WEBHOOK TAB ── -->
+    <!-- WEBHOOK TAB -->
     <div id="tab-webhook" style="display:none;">
         <div class="filter-card">
             <h4 class="fw-bold text-success mb-3">
@@ -721,7 +688,7 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
                 <small class="text-muted mt-1 d-block">
-                    Query param: <code>?days=3</code>
+                    Query params: <code>?days=3&amp;pending_only=true</code>
                 </small>
             </div>
 
@@ -736,7 +703,7 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
                 <small class="text-muted mt-1 d-block">
-                    JSON body: <code>{ "days": 3 }</code>
+                    JSON body: <code>{ "days": 3, "pending_only": true }</code>
                 </small>
             </div>
 
@@ -751,7 +718,7 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
                 <small class="text-muted mt-1 d-block">
-                    Query param: <code>?days=3</code>
+                    Query params: <code>?days=3&amp;pending_only=true</code>
                 </small>
             </div>
 
@@ -760,7 +727,7 @@ HTML_TEMPLATE = """
             <ol class="text-muted small mt-2">
                 <li>Add an <strong>HTTP Request</strong> node → Method: <code>POST</code></li>
                 <li>URL: paste the Webhook URL above</li>
-                <li>Body (JSON): <code>{ "days": 3 }</code></li>
+                <li>Body (JSON): <code>{ "days": 3, "pending_only": true }</code></li>
                 <li>Add a <strong>Split Out</strong> node on the <code>carriers</code> field</li>
                 <li>Connect to Google Sheets, Airtable, or a Write File node</li>
             </ol>
@@ -768,36 +735,44 @@ HTML_TEMPLATE = """
             <hr>
             <h6 class="fw-bold mt-3">Data Sources</h6>
             <p class="text-muted small mb-1">
-                <strong>Status Changes:</strong>
-                <code>data.transportation.gov/resource/dm5j-zc6c.json</code>
-            </p>
-            <p class="text-muted small">
-                <strong>Carrier Master Registry:</strong>
+                <strong>Master Registry (primary):</strong>
                 <code>data.transportation.gov/resource/az4n-8mr2.json</code>
             </p>
+            <p class="text-muted small">
+                <strong>Status Changes (enrichment):</strong>
+                <code>data.transportation.gov/resource/dm5j-zc6c.json</code>
+            </p>
         </div>
-    </div><!-- /tab-webhook -->
+    </div>
 
-</div><!-- /main-container -->
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 // ─────────────────────────────────────────
 // GLOBALS
 // ─────────────────────────────────────────
-let allData     = [];
-let searchTimer = null;
-let currentDays = 3;
+let allData        = [];
+let searchTimer    = null;
+let currentDays    = 3;
+let currentPending = "true";
 
 // ─────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
-    document.getElementById('apiUrl').value     = `${location.origin}/api/data?days=3`;
-    document.getElementById('webhookUrl').value  = `${location.origin}/webhook`;
-    document.getElementById('csvUrl').value      = `${location.origin}/download/csv?days=3`;
+    updateUrlFields();
     loadData();
 });
+
+function updateUrlFields() {
+    document.getElementById('apiUrl').value =
+        `${location.origin}/api/data?days=${currentDays}&pending_only=${currentPending}`;
+    document.getElementById('webhookUrl').value =
+        `${location.origin}/webhook`;
+    document.getElementById('csvUrl').value =
+        `${location.origin}/download/csv?days=${currentDays}&pending_only=${currentPending}`;
+}
 
 // ─────────────────────────────────────────
 // TAB SWITCHING
@@ -816,11 +791,14 @@ function switchTab(name, e) {
 // DATA LOADING
 // ─────────────────────────────────────────
 async function loadData() {
-    currentDays = parseInt(document.getElementById('daysSelect').value, 10);
+    currentDays    = parseInt(document.getElementById('daysSelect').value, 10);
+    currentPending = document.getElementById('pendingFilter').value;
     showOverlay(true);
 
     try {
-        const res    = await fetch(`/api/data?days=${currentDays}`);
+        const res    = await fetch(
+            `/api/data?days=${currentDays}&pending_only=${currentPending}`
+        );
         const result = await res.json();
 
         if (!result.success) {
@@ -832,12 +810,7 @@ async function loadData() {
         populateStateDropdown(allData);
         updateStats(allData);
         renderTable(allData);
-
-        // keep URL fields in sync with selected timeframe
-        document.getElementById('apiUrl').value =
-            `${location.origin}/api/data?days=${currentDays}`;
-        document.getElementById('csvUrl').value =
-            `${location.origin}/download/csv?days=${currentDays}`;
+        updateUrlFields();
 
     } catch (err) {
         console.error(err);
@@ -848,7 +821,7 @@ async function loadData() {
 }
 
 // ─────────────────────────────────────────
-// RENDER TABLE  (DocumentFragment — single DOM write)
+// RENDER TABLE
 // ─────────────────────────────────────────
 function renderTable(data) {
     const tbody    = document.getElementById('tableBody');
@@ -895,12 +868,8 @@ function renderTable(data) {
                     <small class="text-muted">${esc(item.phy_zip)}</small>
                 </td>
                 <td><span class="fw-semibold">${item.power_units ?? '—'}</span></td>
-                <td>
-                    <small class="text-muted">${esc(item.op_auth_type)}</small>
-                </td>
-                <td>
-                    <span class="status-badge ${badgeCls}">${statusText}</span>
-                </td>`;
+                <td><small class="text-muted">${esc(item.op_auth_type)}</small></td>
+                <td><span class="status-badge ${badgeCls}">${statusText}</span></td>`;
 
             fragment.appendChild(tr);
         });
@@ -924,7 +893,7 @@ function esc(str) {
 }
 
 // ─────────────────────────────────────────
-// FILTERING  (debounced)
+// FILTERING
 // ─────────────────────────────────────────
 function onSearchInput() {
     clearTimeout(searchTimer);
@@ -993,7 +962,10 @@ function updateStats(data) {
 // ─────────────────────────────────────────
 function downloadCsv(e) {
     if (e) e.preventDefault();
-    window.open(`/download/csv?days=${currentDays}`, '_blank');
+    window.open(
+        `/download/csv?days=${currentDays}&pending_only=${currentPending}`,
+        '_blank'
+    );
 }
 
 // ─────────────────────────────────────────
@@ -1001,24 +973,22 @@ function downloadCsv(e) {
 // ─────────────────────────────────────────
 function resetFilters(e) {
     if (e) e.preventDefault();
-    document.getElementById('searchInput').value = '';
+    document.getElementById('searchInput').value  = '';
     document.getElementById('stateFilter').value  = '';
     document.getElementById('statusFilter').value = '';
     document.getElementById('daysSelect').value   = '3';
+    document.getElementById('pendingFilter').value = 'true';
     loadData();
 }
 
 // ─────────────────────────────────────────
-// OVERLAY
+// OVERLAY  /  TOAST  /  CLIPBOARD
 // ─────────────────────────────────────────
 function showOverlay(show) {
     document.getElementById('loadingOverlay').style.display =
         show ? 'flex' : 'none';
 }
 
-// ─────────────────────────────────────────
-// TOAST
-// ─────────────────────────────────────────
 function showToast(msg, type = 'success') {
     const el = document.getElementById('appToast');
     el.className = `toast align-items-center text-bg-${type} border-0`;
@@ -1026,9 +996,6 @@ function showToast(msg, type = 'success') {
     bootstrap.Toast.getOrCreateInstance(el).show();
 }
 
-// ─────────────────────────────────────────
-// COPY TO CLIPBOARD
-// ─────────────────────────────────────────
 function copyField(id, label = 'Copied!') {
     const el = document.getElementById(id);
     navigator.clipboard.writeText(el.value)
@@ -1039,6 +1006,15 @@ function copyField(id, label = 'Copied!') {
 </body>
 </html>
 """
+
+
+# ─────────────────────────────────────────────
+# HELPER — parse pending_only flag safely
+# ─────────────────────────────────────────────
+def parse_pending_flag(raw) -> bool:
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in ("true", "1", "yes", "y", "on")
 
 
 # ─────────────────────────────────────────────
@@ -1061,9 +1037,11 @@ def api_data():
             f"Invalid days value. Allowed: {sorted(VALID_DAYS)}", status=400
         )
 
+    pending_only = parse_pending_flag(request.args.get("pending_only", "true"))
+
     try:
-        data = get_cached_ventures(days=days)
-        return api_success(data, days_queried=days)
+        data = get_cached_ventures(days=days, only_pending=pending_only)
+        return api_success(data, days_queried=days, pending_only=pending_only)
     except Exception as exc:
         print(f"[!] /api/data error: {exc}")
         return api_error("Failed to fetch FMCSA data.", status=503, details=exc)
@@ -1072,6 +1050,7 @@ def api_data():
 @app.route("/webhook", methods=["GET", "POST"])
 def n8n_webhook():
     payload = request.get_json(silent=True) or request.args.to_dict()
+
     try:
         days = int(payload.get("days", 3))
     except (ValueError, TypeError):
@@ -1080,11 +1059,15 @@ def n8n_webhook():
     if days not in VALID_DAYS:
         days = 3
 
+    pending_only = parse_pending_flag(payload.get("pending_only", True))
+
     try:
-        data = get_cached_ventures(days=days)
+        data = get_cached_ventures(days=days, only_pending=pending_only)
         return jsonify({
             "success"      : True,
             "timestamp"    : datetime.now().isoformat(),
+            "days_queried" : days,
+            "pending_only" : pending_only,
             "total_records": len(data),
             "carriers"     : data,
         })
@@ -1096,6 +1079,7 @@ def n8n_webhook():
 @app.route("/run", methods=["GET", "POST"])
 def run_pipeline():
     payload = request.get_json(silent=True) or request.args.to_dict()
+
     try:
         days = int(payload.get("days", 3))
     except (ValueError, TypeError):
@@ -1104,12 +1088,15 @@ def run_pipeline():
     if days not in VALID_DAYS:
         days = 3
 
+    pending_only = parse_pending_flag(payload.get("pending_only", True))
+
     try:
-        data = get_cached_ventures(days=days)
+        data = get_cached_ventures(days=days, only_pending=pending_only)
         return api_success(
             data,
             days_queried=days,
-            download_url=f"/download/csv?days={days}",
+            pending_only=pending_only,
+            download_url=f"/download/csv?days={days}&pending_only={pending_only}",
         )
     except Exception as exc:
         print(f"[!] /run error: {exc}")
@@ -1118,10 +1105,7 @@ def run_pipeline():
 
 @app.route("/download/csv", methods=["GET"])
 def download_csv():
-    """
-    Stream CSV directly from memory — no ephemeral filesystem dependency.
-    Respects ?days= so the download always matches the dashboard timeframe.
-    """
+    """Stream CSV directly from memory — respects both ?days and ?pending_only."""
     try:
         days = int(request.args.get("days", 3))
     except (ValueError, TypeError):
@@ -1130,8 +1114,10 @@ def download_csv():
     if days not in VALID_DAYS:
         days = 3
 
+    pending_only = parse_pending_flag(request.args.get("pending_only", "true"))
+
     try:
-        data = get_cached_ventures(days=days)
+        data = get_cached_ventures(days=days, only_pending=pending_only)
     except Exception as exc:
         return api_error("Could not generate CSV.", status=503, details=exc)
 
@@ -1141,7 +1127,8 @@ def download_csv():
         )
 
     csv_bytes = build_csv_bytes(data)
-    filename  = f"true_new_ventures_{datetime.now().strftime('%Y%m%d')}.csv"
+    suffix    = "pending" if pending_only else "all"
+    filename  = f"true_new_ventures_{suffix}_{datetime.now().strftime('%Y%m%d')}.csv"
 
     return send_file(
         io.BytesIO(csv_bytes),
