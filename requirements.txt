@@ -1,0 +1,14 @@
+flask
+requests
+pandas
+gunicorn
+werkzeug
+blinker
+itsdangerous
+jinja2
+markupsafe
+numpy
+python-dateutil
+pytz
+tzdata
+six
