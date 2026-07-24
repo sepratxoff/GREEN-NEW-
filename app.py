@@ -109,7 +109,7 @@ def fetch_true_new_ventures(days=3):
         combined.append(merged)
 
     combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(combined)} strict new ventures for last {days} days.")
+    print(f"[+] Successfully processed {len(combined)} true new ventures for last {days} days.")
     return combined
 
 HTML_TEMPLATE = """
@@ -125,8 +125,6 @@ HTML_TEMPLATE = """
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
     <!-- Google Fonts Inter -->
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --font-main: 'Plus Jakarta Sans', sans-serif;
@@ -341,9 +339,8 @@ HTML_TEMPLATE = """
             </a>
             <div class="d-flex align-items-center gap-4">
                 <a href="#" class="nav-link active" onclick="switchTab('dashboard', event)">Dashboard</a>
-                <a href="#" class="nav-link" onclick="switchTab('analytics', event)">Analytics</a>
                 <a href="#" class="nav-link" onclick="switchTab('webhook', event)">API / Webhook</a>
-                <a href="/download/excel" class="btn btn-green btn-sm"><i class="fa-solid fa-file-excel me-1"></i> Export Excel</a>
+                <a href="/download/csv" class="btn btn-green btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
             </div>
         </div>
     </nav>
@@ -436,8 +433,7 @@ HTML_TEMPLATE = """
                             </div>
                             <div class="d-flex gap-2">
                                 <span id="resultCount" class="text-muted small fw-semibold align-self-center me-2">Showing 0 results</span>
-                                <a href="/download/csv" class="btn btn-outline-secondary btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
-                                <a href="/download/excel" class="btn btn-outline-success btn-sm" target="_blank"><i class="fa-solid fa-file-excel me-1"></i> Export Excel</a>
+                                <a href="/download/csv" class="btn btn-green btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
                             </div>
                         </div>
 
@@ -457,24 +453,6 @@ HTML_TEMPLATE = """
                                 </tbody>
                             </table>
                         </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- ANALYTICS TAB -->
-        <div id="tab-analytics" class="tab-pane" style="display: none;">
-            <div class="row g-4">
-                <div class="col-lg-6">
-                    <div class="panel-card">
-                        <h5 class="fw-bold mb-3">Top 10 States for New Ventures</h5>
-                        <canvas id="stateChart" height="250"></canvas>
-                    </div>
-                </div>
-                <div class="col-lg-6">
-                    <div class="panel-card">
-                        <h5 class="fw-bold mb-3">Registration Volume Over Time</h5>
-                        <canvas id="dateChart" height="250"></canvas>
                     </div>
                 </div>
             </div>
@@ -502,29 +480,18 @@ HTML_TEMPLATE = """
                         <button class="btn btn-outline-success" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
                 </div>
-
-                <div class="mb-3">
-                    <label class="form-label fw-bold small">Direct Excel Download URL</label>
-                    <div class="input-group shadow-sm">
-                        <input type="text" class="form-control font-monospace bg-light" id="excelUrl" value="" readonly>
-                        <button class="btn btn-outline-success" onclick="copyText('excelUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
-                    </div>
-                </div>
             </div>
         </div>
 
     </div>
 
-    <!-- Bootstrap JS & Charts -->
+    <!-- Bootstrap JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let allData = [];
-        let stateChartInstance = null;
-        let dateChartInstance = null;
 
         document.getElementById('webhookUrl').value = window.location.origin + '/webhook';
         document.getElementById('csvUrl').value = window.location.origin + '/download/csv';
-        document.getElementById('excelUrl').value = window.location.origin + '/download/excel';
 
         function switchTab(tabName, event) {
             if (event) event.preventDefault();
@@ -532,12 +499,7 @@ HTML_TEMPLATE = """
             if (event && event.currentTarget) event.currentTarget.classList.add('active');
 
             document.getElementById('tab-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
-            document.getElementById('tab-analytics').style.display = tabName === 'analytics' ? 'block' : 'none';
             document.getElementById('tab-webhook').style.display = tabName === 'webhook' ? 'block' : 'none';
-
-            if (tabName === 'analytics') {
-                renderCharts();
-            }
         }
 
         async function loadData() {
@@ -642,61 +604,6 @@ HTML_TEMPLATE = """
             loadData();
         }
 
-        function renderCharts() {
-            if (allData.length === 0) return;
-
-            const stateCounts = {};
-            allData.forEach(item => {
-                if (item.phy_state) {
-                    stateCounts[item.phy_state] = (stateCounts[item.phy_state] || 0) + 1;
-                }
-            });
-            const sortedStates = Object.entries(stateCounts).sort((a,b) => b[1] - a[1]).slice(0, 10);
-
-            if (stateChartInstance) stateChartInstance.destroy();
-            const ctx1 = document.getElementById('stateChart').getContext('2d');
-            stateChartInstance = new Chart(ctx1, {
-                type: 'bar',
-                data: {
-                    labels: sortedStates.map(i => i[0]),
-                    datasets: [{
-                        label: 'New Ventures',
-                        data: sortedStates.map(i => i[1]),
-                        backgroundColor: '#10b981',
-                        borderRadius: 6
-                    }]
-                },
-                options: { responsive: true, plugins: { legend: { display: false } } }
-            });
-
-            const dateCounts = {};
-            allData.forEach(item => {
-                if (item.add_date) {
-                    dateCounts[item.add_date] = (dateCounts[item.add_date] || 0) + 1;
-                }
-            });
-            const sortedDates = Object.entries(dateCounts).sort((a,b) => a[0].localeCompare(b[0]));
-
-            if (dateChartInstance) dateChartInstance.destroy();
-            const ctx2 = document.getElementById('dateChart').getContext('2d');
-            dateChartInstance = new Chart(ctx2, {
-                type: 'line',
-                data: {
-                    labels: sortedDates.map(i => i[0]),
-                    datasets: [{
-                        label: 'Registrations',
-                        data: sortedDates.map(i => i[1]),
-                        borderColor: '#10b981',
-                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                        fill: true,
-                        tension: 0.3,
-                        pointRadius: 4
-                    }]
-                },
-                options: { responsive: true, plugins: { legend: { display: false } } }
-            });
-        }
-
         function copyText(elementId) {
             const copyText = document.getElementById(elementId);
             copyText.select();
@@ -794,26 +701,8 @@ def download_csv():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
     if os.path.exists(latest_path):
-        return send_file(latest_path, mimetype="text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
+        return send_file(latest_path, mimetype="text/css" if False else "text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
     return jsonify({"error": "No CSV file generated yet."}), 404
-
-@app.route("/download/excel", methods=["GET"])
-def download_excel():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
-    if os.path.exists(latest_path):
-        df = pd.read_csv(latest_path)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='New Ventures')
-        output.seek(0)
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f"true_new_ventures_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        )
-    return jsonify({"error": "No data generated yet."}), 404
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
