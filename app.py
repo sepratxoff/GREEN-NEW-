@@ -9,80 +9,97 @@ import io
 
 app = Flask(__name__)
 
+STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
 CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
 
-def fetch_new_ventures(days=3):
+def fetch_true_new_ventures(days=3):
     today = datetime.now()
     start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
-    print(f"[*] Fetching strict new ventures since {start_date} (last {days} days)...")
+    print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
     
-    all_carriers = []
-    limit = 1000
+    all_status_changes = []
+    limit = 500
     offset = 0
     
     while True:
         params = {
-            "$where": f"add_date >= '{start_date}' AND status_code = 'A'",
+            "$where": f"status_change_date >= '{start_date}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
             "$limit": limit,
             "$offset": offset,
-            "$order": "add_date DESC"
+            "$order": "status_change_date DESC"
         }
         try:
-            resp = requests.get(CARRIER_INFO_URL, params=params)
+            resp = requests.get(STATUS_CHANGE_URL, params=params)
             resp.raise_for_status()
             batch = resp.json()
         except Exception as e:
-            print(f"[!] API error: {e}")
+            print(f"[!] Error fetching status changes: {e}")
             break
             
         if not batch:
             break
-        all_carriers.extend(batch)
+        all_status_changes.extend(batch)
         if len(batch) < limit:
             break
         offset += limit
-
-    print(f"[+] Retrieved {len(all_carriers)} verified active new ventures for {days} days.")
-    
-    verified_ventures = []
-    for cd in all_carriers:
+    print(f"[+] Fetched {len(all_status_changes)} status change records.")
+    if not all_status_changes:
+        return []
+    status_map = {}
+    for sc in all_status_changes:
+        dot = sc.get("usdot_number")
+        if dot and dot not in status_map:
+            status_map[dot] = sc
+    unique_dots = list(status_map.keys())
+    print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
+    carrier_records = []
+    batch_size = 50
+    for i in range(0, len(unique_dots), batch_size):
+        batch_dots = unique_dots[i:i+batch_size]
+        dots_str = ",".join([f"'{d}'" for d in batch_dots])
+        params = {
+            "$where": f"dot_number in ({dots_str})",
+            "$limit": batch_size
+        }
+        try:
+            resp = requests.get(CARRIER_INFO_URL, params=params)
+            resp.raise_for_status()
+            carrier_records.extend(resp.json())
+        except Exception as e:
+            print(f"[!] Error fetching carrier batch: {e}")
+    combined = []
+    cutoff_date_str = start_date
+    for cd in carrier_records:
         dot = cd.get("dot_number")
-        legal_name = cd.get("legal_name", "").strip()
-        if not dot or not legal_name:
-            continue
-
+        sc = status_map.get(dot, {})
         add_date = cd.get("add_date", "")
-        if not add_date or add_date < start_date:
+        
+        # STRICT RULE: add_date must be strictly within the requested timeframe (>= start_date)
+        if not add_date or add_date < cutoff_date_str:
             continue
-
-        docket = cd.get("docket1", "")
-        if docket and cd.get("docket1prefix"):
-            docket = f"{cd.get('docket1prefix')}{docket}"
-
         merged = {
             "usdot_number": dot,
-            "docket_number": docket or "—",
-            "legal_name": legal_name,
-            "dba_name": cd.get("dba_name") or "—",
+            "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
+            "legal_name": cd.get("legal_name") or "",
+            "dba_name": cd.get("dba_name") or "",
             "add_date": add_date,
-            "status_change_date": cd.get("mcs150_date", add_date),
-            "op_auth_status": "ACTIVE" if cd.get("status_code") == "A" else "PENDING",
-            "reason": "Initial Registration",
-            "op_auth_type": cd.get("classdef") or "Authorized For Hire",
-            "phone": cd.get("phone") or cd.get("cell_phone") or "—",
-            "email_address": cd.get("email_address") or "—",
+            "status_change_date": sc.get("status_change_date") or add_date,
+            "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
+            "reason": sc.get("reason") or "Initial Status",
+            "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
+            "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
+            "email_address": cd.get("email_address") or "N/A",
             "phy_street": cd.get("phy_street") or "",
             "phy_city": cd.get("phy_city") or "",
             "phy_state": cd.get("phy_state") or "",
             "phy_zip": cd.get("phy_zip") or "",
             "power_units": int(cd.get("power_units") or 1),
-            "drivers": int(cd.get("total_drivers") or cd.get("total_cdl") or 1),
             "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
         }
-        verified_ventures.append(merged)
-
-    verified_ventures.sort(key=lambda x: x["add_date"], reverse=True)
-    return verified_ventures
+        combined.append(merged)
+    combined.sort(key=lambda x: x["add_date"], reverse=True)
+    print(f"[+] Successfully processed {len(combined)} true new ventures for last {days} days (add_date >= {cutoff_date_str}).")
+    return combined
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -545,7 +562,7 @@ def api_data():
     except ValueError:
         days = 3
 
-    data = fetch_new_ventures(days=days)
+    data = fetch_true_new_ventures(days=days)
     
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
@@ -567,7 +584,7 @@ def run_pipeline():
     except ValueError:
         days = 3
 
-    data = fetch_new_ventures(days=days)
+    data = fetch_true_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
@@ -597,7 +614,7 @@ def n8n_webhook():
     except (ValueError, TypeError):
         days = 3
 
-    data = fetch_new_ventures(days=days)
+    data = fetch_true_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
