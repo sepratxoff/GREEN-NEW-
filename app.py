@@ -43,20 +43,16 @@ def fetch_true_new_ventures(days=3):
         if len(batch) < limit:
             break
         offset += limit
-
     print(f"[+] Fetched {len(all_status_changes)} status change records (Pending / Initial Status).")
     if not all_status_changes:
         return []
-
     status_map = {}
     for sc in all_status_changes:
         dot = sc.get("usdot_number")
         if dot and dot not in status_map:
             status_map[dot] = sc
-
     unique_dots = list(status_map.keys())
     print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
-
     carrier_records = []
     batch_size = 50
     for i in range(0, len(unique_dots), batch_size):
@@ -72,12 +68,10 @@ def fetch_true_new_ventures(days=3):
             carrier_records.extend(resp.json())
         except Exception as e:
             print(f"[!] Error fetching carrier batch: {e}")
-
     # Build final combined dataset with strict definition:
     # Must have add_date within the requested days window OR status_change_date within window and reason == Initial Status / Pending
     combined = []
     cutoff_date_str = start_date
-
     for cd in carrier_records:
         dot = cd.get("dot_number")
         sc = status_map.get(dot, {})
@@ -91,7 +85,6 @@ def fetch_true_new_ventures(days=3):
         
         if not (is_recent_add or is_recent_status):
             continue
-
         merged = {
             "usdot_number": dot,
             "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
@@ -112,7 +105,6 @@ def fetch_true_new_ventures(days=3):
             "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
         }
         combined.append(merged)
-
     # Sort descending by add_date / status_change_date
     combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
     print(f"[+] Successfully processed {len(combined)} true new ventures (Pending / Initial Status) for the last {days} days.")
@@ -196,13 +188,11 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-
     <div id="loadingOverlay">
         <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
         <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
         <p class="text-muted small">Fetching newly issued USDOTs and Initial Status authorities...</p>
     </div>
-
     <div class="sidebar d-flex flex-column justify-content-between">
         <div>
             <div class="sidebar-brand">
@@ -221,7 +211,6 @@ HTML_TEMPLATE = """
             <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> New Entrant Verified</small>
         </div>
     </div>
-
     <div class="main-content">
         
         <div id="tab-dashboard" class="tab-pane">
