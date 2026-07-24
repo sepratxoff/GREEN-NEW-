@@ -12,20 +12,19 @@ app = Flask(__name__)
 STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
 CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
 
-def fetch_true_new_ventures(days=7):
+def fetch_true_new_ventures(days=3):
     today = datetime.now()
     start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
     print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
     
-    # We query status changes where reason is 'Initial Status' or op_auth_status is 'Pending' / newly 'Active'
-    # and combine with carrier details to ensure 100% precision.
+    # Query status changes where status is Pending or reason is Initial Status (New Entrant Program / New DOT / Authority)
     all_status_changes = []
     limit = 500
     offset = 0
     
     while True:
         params = {
-            "$where": f"status_change_date >= '{start_date}'",
+            "$where": f"status_change_date >= '{start_date}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
             "$limit": limit,
             "$offset": offset,
             "$order": "status_change_date DESC"
@@ -45,20 +44,15 @@ def fetch_true_new_ventures(days=7):
             break
         offset += limit
 
-    print(f"[+] Fetched {len(all_status_changes)} status change records.")
+    print(f"[+] Fetched {len(all_status_changes)} status change records (Pending / Initial Status).")
     if not all_status_changes:
         return []
 
-    # Map USDOT to status change info
     status_map = {}
-    usdot_list = []
     for sc in all_status_changes:
         dot = sc.get("usdot_number")
-        if dot:
-            usdot_list.append(dot)
-            # Keep the latest record for each USDOT
-            if dot not in status_map:
-                status_map[dot] = sc
+        if dot and dot not in status_map:
+            status_map[dot] = sc
 
     unique_dots = list(status_map.keys())
     print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
@@ -79,25 +73,23 @@ def fetch_true_new_ventures(days=7):
         except Exception as e:
             print(f"[!] Error fetching carrier batch: {e}")
 
-    # Build final combined dataset
+    # Build final combined dataset with strict definition:
+    # Must have add_date within the requested days window OR status_change_date within window and reason == Initial Status / Pending
     combined = []
-    cutoff_add_date = today - timedelta(days=90) # True new venture check: added within last 90 days max
+    cutoff_date_str = start_date
 
     for cd in carrier_records:
         dot = cd.get("dot_number")
         sc = status_map.get(dot, {})
         add_date = cd.get("add_date", "")
+        status_change_date = sc.get("status_change_date", "")
         
-        # Verify add_date exists and is valid
-        if not add_date:
-            continue
-            
-        try:
-            add_dt = datetime.strptime(add_date[:8], "%Y%m%d")
-            # Strict true new venture condition: added within last 90 days or status change is Initial Status
-            if add_dt < cutoff_add_date and sc.get("reason") != "Initial Status":
-                continue
-        except ValueError:
+        # Verify it's truly a new venture (getting their DOT or authority for the first time)
+        # add_date or status_change_date must be within the last N days
+        is_recent_add = add_date and add_date >= cutoff_date_str
+        is_recent_status = status_change_date and status_change_date >= cutoff_date_str
+        
+        if not (is_recent_add or is_recent_status):
             continue
 
         merged = {
@@ -105,8 +97,8 @@ def fetch_true_new_ventures(days=7):
             "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
             "legal_name": cd.get("legal_name") or "",
             "dba_name": cd.get("dba_name") or "",
-            "add_date": add_date,
-            "status_change_date": sc.get("status_change_date") or "",
+            "add_date": add_date or status_change_date,
+            "status_change_date": status_change_date,
             "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
             "reason": sc.get("reason") or "Initial Status",
             "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
@@ -121,9 +113,9 @@ def fetch_true_new_ventures(days=7):
         }
         combined.append(merged)
 
-    # Sort descending by add_date
-    combined.sort(key=lambda x: x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(combined)} true new ventures.")
+    # Sort descending by add_date / status_change_date
+    combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
+    print(f"[+] Successfully processed {len(combined)} true new ventures (Pending / Initial Status) for the last {days} days.")
     return combined
 
 HTML_TEMPLATE = """
@@ -133,13 +125,9 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FMCSA True New Ventures Intelligence Platform</title>
-    <!-- Bootstrap 5 CSS -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <!-- FontAwesome Icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
-    <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <!-- Chart.js -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
@@ -149,135 +137,57 @@ HTML_TEMPLATE = """
             --bg-color: #f8fafc;
         }
         body { background-color: var(--bg-color); color: #1e293b; overflow-x: hidden; }
-        
-        /* Sidebar Styling */
         .sidebar {
             width: var(--sidebar-width);
             height: 100vh;
             position: fixed;
-            top: 0;
-            left: 0;
+            top: 0; left: 0;
             background: #0f172a;
             color: #94a3b8;
             z-index: 1000;
-            transition: all 0.3s ease;
             box-shadow: 4px 0 10px rgba(0,0,0,0.05);
         }
         .sidebar-brand {
-            font-size: 1.25rem;
-            font-weight: 700;
-            color: #fff;
-            padding: 1.5rem 1.25rem;
-            display: flex;
-            align-items: center;
-            gap: 10px;
+            font-size: 1.25rem; font-weight: 700; color: #fff;
+            padding: 1.5rem 1.25rem; display: flex; align-items: center; gap: 10px;
             border-bottom: 1px solid #1e293b;
         }
-        .sidebar-menu {
-            padding: 1.25rem 0.75rem;
-            list-style: none;
-            margin: 0;
-        }
-        .sidebar-menu li {
-            margin-bottom: 0.5rem;
-        }
+        .sidebar-menu { padding: 1.25rem 0.75rem; list-style: none; margin: 0; }
+        .sidebar-menu li { margin-bottom: 0.5rem; }
         .sidebar-menu a {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 10px 14px;
-            color: #94a3b8;
-            text-decoration: none;
-            font-weight: 500;
-            border-radius: 8px;
-            transition: all 0.2s ease;
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 14px; color: #94a3b8; text-decoration: none;
+            font-weight: 500; border-radius: 8px; transition: all 0.2s ease;
         }
         .sidebar-menu a:hover, .sidebar-menu a.active {
-            background: var(--primary-color);
-            color: #fff;
+            background: var(--primary-color); color: #fff;
             box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
         }
-
-        /* Main Content Styling */
-        .main-content {
-            margin-left: var(--sidebar-width);
-            padding: 2.5rem;
-            min-height: 100vh;
-        }
-
-        /* Cards & Panels */
+        .main-content { margin-left: var(--sidebar-width); padding: 2.5rem; min-height: 100vh; }
         .card-stat {
-            background: #fff;
-            border: none;
-            border-radius: 14px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.03);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-            position: relative;
-            overflow: hidden;
-        }
-        .card-stat:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 10px 25px rgba(0,0,0,0.06);
+            background: #fff; border: none; border-radius: 14px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.03); position: relative; overflow: hidden;
         }
         .card-stat::after {
-            content: '';
-            position: absolute;
-            top: 0; left: 0; width: 4px; height: 100%;
+            content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
             background: var(--primary-color);
         }
-        
         .panel-box {
-            background: #fff;
-            border: none;
-            border-radius: 16px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.03);
-            padding: 1.75rem;
-            margin-bottom: 2rem;
-        }
-
-        /* Table Styling */
-        .table-custom {
-            white-space: nowrap;
+            background: #fff; border: none; border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.03); padding: 1.75rem; margin-bottom: 2rem;
         }
         .table-custom th {
-            font-weight: 600;
-            color: #475569;
-            background: #f8fafc !important;
-            border-bottom: 2px solid #e2e8f0;
-            padding: 12px 16px;
+            font-weight: 600; color: #475569; background: #f8fafc !important;
+            border-bottom: 2px solid #e2e8f0; padding: 12px 16px; white-space: nowrap;
         }
-        .table-custom td {
-            padding: 14px 16px;
-            vertical-align: middle;
-            color: #334155;
-        }
-        .table-container {
-            max-height: 650px;
-            overflow-y: auto;
-            border-radius: 12px;
-            border: 1px solid #e2e8f0;
-        }
-
-        /* Loader Overlay */
+        .table-custom td { padding: 14px 16px; vertical-align: middle; color: #334155; white-space: nowrap; }
+        .table-container { max-height: 650px; overflow-y: auto; border-radius: 12px; border: 1px solid #e2e8f0; }
         #loadingOverlay {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(255, 255, 255, 0.85);
-            z-index: 9999;
-            justify-content: center;
-            align-items: center;
-            flex-direction: column;
-            gap: 15px;
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(255, 255, 255, 0.85); z-index: 9999;
+            justify-content: center; align-items: center; flex-direction: column; gap: 15px;
         }
-
-        .badge-status {
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-weight: 500;
-            font-size: 0.75rem;
-        }
-
+        .badge-status { padding: 6px 12px; border-radius: 20px; font-weight: 500; font-size: 0.75rem; }
         @media (max-width: 992px) {
             .sidebar { width: 70px; }
             .sidebar .sidebar-brand span, .sidebar .sidebar-menu span, .sidebar .sidebar-footer { display: none; }
@@ -287,14 +197,12 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-    <!-- Loading Overlay -->
     <div id="loadingOverlay">
         <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
-        <h5 class="fw-semibold text-dark mt-2">Querying FMCSA Database & Processing New Ventures...</h5>
-        <p class="text-muted small">Please wait while we verify authorities and fetch company intelligence.</p>
+        <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
+        <p class="text-muted small">Fetching newly issued USDOTs and Initial Status authorities...</p>
     </div>
 
-    <!-- Sidebar -->
     <div class="sidebar d-flex flex-column justify-content-between">
         <div>
             <div class="sidebar-brand">
@@ -310,25 +218,23 @@ HTML_TEMPLATE = """
             </ul>
         </div>
         <div class="p-3 m-3 rounded bg-dark border border-secondary text-center sidebar-footer">
-            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> Live & Verified</small>
+            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> New Entrant Verified</small>
         </div>
     </div>
 
-    <!-- Main Content -->
     <div class="main-content">
         
-        <!-- DASHBOARD TAB -->
         <div id="tab-dashboard" class="tab-pane">
             <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
                 <div>
-                    <h2 class="fw-bold mb-1">True New Ventures Intelligence</h2>
-                    <p class="text-muted mb-0">Live FMCSA carrier registrations granted authority for the first time.</p>
+                    <h2 class="fw-bold mb-1">True New Ventures (New Entrant Program)</h2>
+                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time.</p>
                 </div>
                 <div class="d-flex align-items-center gap-2">
                     <select id="daysSelect" class="form-select shadow-sm" style="width: 150px;">
                         <option value="1">Last 1 Day</option>
-                        <option value="3">Last 3 Days</option>
-                        <option value="7" selected>Last 7 Days</option>
+                        <option value="3" selected>Last 3 Days</option>
+                        <option value="7">Last 7 Days</option>
                         <option value="14">Last 14 Days</option>
                         <option value="30">Last 30 Days</option>
                     </select>
@@ -338,17 +244,16 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Stats Cards -->
             <div class="row g-4 mb-4">
                 <div class="col-md-3">
                     <div class="card card-stat p-4">
-                        <span class="text-muted small fw-semibold text-uppercase">Total New Ventures</span>
+                        <span class="text-muted small fw-semibold text-uppercase">New Entrants</span>
                         <h2 id="statTotal" class="fw-bold mt-2 mb-0 text-dark">0</h2>
                     </div>
                 </div>
                 <div class="col-md-3">
                     <div class="card card-stat p-4" style="--primary-color: #10b981;">
-                        <span class="text-muted small fw-semibold text-uppercase">Active Authorities</span>
+                        <span class="text-muted small fw-semibold text-uppercase">Pending / Initial</span>
                         <h2 id="statActive" class="fw-bold mt-2 mb-0 text-success">0</h2>
                     </div>
                 </div>
@@ -366,7 +271,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Table Panel -->
             <div class="panel-box">
                 <div class="row g-3 mb-4">
                     <div class="col-md-6">
@@ -383,8 +287,8 @@ HTML_TEMPLATE = """
                     <div class="col-md-3">
                         <select id="statusFilter" class="form-select shadow-sm" onchange="filterTable()">
                             <option value="">All Statuses</option>
+                            <option value="Pending">Pending / Initial</option>
                             <option value="Active">Active</option>
-                            <option value="Pending">Pending</option>
                         </select>
                     </div>
                 </div>
@@ -395,8 +299,8 @@ HTML_TEMPLATE = """
                             <tr>
                                 <th>USDOT / Docket</th>
                                 <th>Company Name</th>
-                                <th>Add Date</th>
-                                <th>Status</th>
+                                <th>Entry Date</th>
+                                <th>Status / Reason</th>
                                 <th>Contact Information</th>
                                 <th>Location</th>
                                 <th>Power Units</th>
@@ -409,7 +313,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- ANALYTICS TAB -->
         <div id="tab-analytics" class="tab-pane" style="display: none;">
             <h2 class="fw-bold mb-4">New Ventures Analytics & Insights</h2>
             <div class="row g-4">
@@ -428,7 +331,6 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- WEBHOOK TAB -->
         <div id="tab-webhook" class="tab-pane" style="display: none;">
             <h2 class="fw-bold mb-4">n8n Automation & Webhook Integration</h2>
             <div class="panel-box">
@@ -441,7 +343,7 @@ HTML_TEMPLATE = """
                         <input type="text" class="form-control font-monospace bg-light" id="webhookUrl" value="" readonly>
                         <button class="btn btn-outline-primary" onclick="copyText('webhookUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
-                    <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 7 }</code></small>
+                    <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 3 }</code></small>
                 </div>
 
                 <div class="mb-4">
@@ -464,14 +366,12 @@ HTML_TEMPLATE = """
 
     </div>
 
-    <!-- Bootstrap & JS Scripts -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let allData = [];
         let stateChartInstance = null;
         let dateChartInstance = null;
 
-        // Set dynamic URLs
         document.getElementById('webhookUrl').value = window.location.origin + '/webhook';
         document.getElementById('csvUrl').value = window.location.origin + '/download/csv';
         document.getElementById('excelUrl').value = window.location.origin + '/download/excel';
@@ -529,12 +429,12 @@ HTML_TEMPLATE = """
             tbody.innerHTML = '';
 
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No true new ventures found for this period.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period.</td></tr>';
                 return;
             }
 
             data.forEach(item => {
-                const badgeClass = item.op_auth_status === 'Active' ? 'bg-success bg-opacity-10 text-success' : 'bg-warning bg-opacity-10 text-warning';
+                const badgeClass = item.op_auth_status === 'Pending' ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
                 const row = `<tr>
                     <td>
                         <div class="fw-bold">${item.usdot_number}</div>
@@ -545,7 +445,10 @@ HTML_TEMPLATE = """
                         ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
                     </td>
                     <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
-                    <td><span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span></td>
+                    <td>
+                        <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
+                        <div class="small text-muted mt-1">${item.reason}</div>
+                    </td>
                     <td>
                         <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
                         <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
@@ -559,8 +462,8 @@ HTML_TEMPLATE = """
 
         function updateStats(data) {
             document.getElementById('statTotal').innerText = data.length;
-            const activeCount = data.filter(i => i.op_auth_status === 'Active').length;
-            document.getElementById('statActive').innerText = activeCount;
+            const pendingCount = data.filter(i => i.op_auth_status === 'Pending' || i.reason === 'Initial Status').length;
+            document.getElementById('statActive').innerText = pendingCount;
             const states = new Set(data.map(i => i.phy_state)).size;
             document.getElementById('statStates').innerText = states;
             const totalUnits = data.reduce((acc, curr) => acc + (parseInt(curr.power_units) || 0), 0);
@@ -590,7 +493,6 @@ HTML_TEMPLATE = """
         function renderCharts() {
             if (allData.length === 0) return;
 
-            // State chart data
             const stateCounts = {};
             allData.forEach(item => {
                 if (item.phy_state) {
@@ -615,7 +517,6 @@ HTML_TEMPLATE = """
                 options: { responsive: true, plugins: { legend: { display: false } } }
             });
 
-            // Date chart data
             const dateCounts = {};
             allData.forEach(item => {
                 if (item.add_date) {
@@ -666,9 +567,9 @@ def index():
 @app.route("/api/data", methods=["GET"])
 def api_data():
     try:
-        days = int(request.args.get("days", 7))
+        days = int(request.args.get("days", 3))
     except ValueError:
-        days = 7
+        days = 3
 
     data = fetch_true_new_ventures(days=days)
     
@@ -688,9 +589,9 @@ def api_data():
 @app.route("/run", methods=["GET", "POST"])
 def run_pipeline():
     try:
-        days = int(request.args.get("days", 7))
+        days = int(request.args.get("days", 3))
     except ValueError:
-        days = 7
+        days = 3
 
     data = fetch_true_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -718,9 +619,9 @@ def run_pipeline():
 def n8n_webhook():
     req_data = request.json or request.args.to_dict()
     try:
-        days = int(req_data.get("days", 7))
+        days = int(req_data.get("days", 3))
     except (ValueError, TypeError):
-        days = 7
+        days = 3
 
     data = fetch_true_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
