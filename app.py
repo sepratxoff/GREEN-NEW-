@@ -14,103 +14,130 @@ CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
 
 def fetch_new_ventures(days=1):
     """
-    Robust New Ventures Engine:
-    1. Looks at the last N days (default 1). If today/yesterday has 0 records due to government lag/weekends,
-       it automatically expands to the most recent available active batch date.
-    2. Enforces op_auth_type == 'Motor Carrier of Property (Except Household Goods)'.
+    Final Verified Engine:
+    1. Queries status changes for the last N days where op_auth_type is strictly
+       'Motor Carrier of Property (Except Household Goods)' and status is Pending / Initial Status.
+    2. Fetches master profiles from az4n-8mr2.json.
     3. Enforces add_date strictly within 2026.
+    4. Weekend/Lag Fallback: If 0 records found for today, automatically pulls the latest available active batch.
     """
     today = datetime.now()
     start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
-    print(f"[*] Fetching new ventures since {start_date} (last {days} day)...")
+    print(f"[*] Fetching strict Motor Carrier of Property new ventures since {start_date} (last {days} day)...")
     
-    all_carriers = []
-    limit = 1000
+    target_auth_type = "Motor Carrier of Property (Except Household Goods)"
+    all_status_changes = []
+    limit = 500
     offset = 0
     
-    while True:
+    current_days_window = days
+    while current_days_window <= 14:
+        start_date = (today - timedelta(days=current_days_window)).strftime('%Y%m%d')
+        all_status_changes = []
+        offset = 0
+        
+        while True:
+            params = {
+                "$where": f"status_change_date >= '{start_date}' AND op_auth_type = '{target_auth_type}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
+                "$limit": limit,
+                "$offset": offset,
+                "$order": "status_change_date DESC"
+            }
+            try:
+                resp = requests.get(STATUS_CHANGE_URL, params=params)
+                resp.raise_for_status()
+                batch = resp.json()
+            except Exception as e:
+                print(f"[!] Error fetching status changes: {e}")
+                break
+                
+            if not batch:
+                break
+            all_status_changes.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += limit
+
+        if all_status_changes:
+            break
+        current_days_window += 3
+
+    print(f"[+] Fetched {len(all_status_changes)} status change records for Motor Carrier of Property.")
+    if not all_status_changes:
+        return []
+
+    status_map = {}
+    for sc in all_status_changes:
+        dot = sc.get("usdot_number")
+        if dot and dot not in status_map:
+            status_map[dot] = sc
+
+    unique_dots = list(status_map.keys())
+    print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
+
+    carrier_records = []
+    batch_size = 50
+    for i in range(0, len(unique_dots), batch_size):
+        batch_dots = unique_dots[i:i+batch_size]
+        dots_str = ",".join([f"'{d}'" for d in batch_dots])
         params = {
-            "$where": f"add_date >= '{start_date}' AND status_code = 'A'",
-            "$limit": limit,
-            "$offset": offset,
-            "$order": "add_date DESC"
+            "$where": f"dot_number in ({dots_str})",
+            "$limit": batch_size
         }
         try:
             resp = requests.get(CARRIER_INFO_URL, params=params)
             resp.raise_for_status()
-            batch = resp.json()
+            carrier_records.extend(resp.json())
         except Exception as e:
-            print(f"[!] API error: {e}")
-            break
-            
-        if not batch:
-            break
-        all_carriers.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    # Fallback mechanism: If government database hasn't published today's batch yet (e.g. weekend/lag), 
-    # automatically grab the most recent available batch (e.g., July 23rd) so the table is never empty!
-    if not all_carriers and days == 1:
-        print("[!] 0 records found for last 1 day. Pulling latest available batch...")
-        params = {
-            "$where": "status_code = 'A'",
-            "$limit": 100,
-            "$offset": 0,
-            "$order": "add_date DESC"
-        }
-        try:
-            resp = requests.get(CARRIER_INFO_URL, params=params)
-            resp.raise_for_status()
-            all_carriers = resp.json()
-        except Exception as e:
-            print(f"[!] Fallback error: {e}")
-
-    print(f"[+] Retrieved {len(all_carriers)} carriers.")
+            print(f"[!] Error fetching carrier batch: {e}")
 
     verified_ventures = []
-    for cd in all_carriers:
+    for cd in carrier_records:
         dot = cd.get("dot_number")
+        sc = status_map.get(dot, {})
         legal_name = cd.get("legal_name", "").strip()
-        if not dot or not legal_name:
+        if not legal_name:
             continue
 
         add_date = cd.get("add_date", "")
+        
+        # STRICT RULE 1: add_date must start with 2026 (No older years like 2023 or 2024)
         if not add_date or not add_date.startswith("2026"):
             continue
 
-        docket = cd.get("docket1", "")
-        if docket and cd.get("docket1prefix"):
+        # STRICT RULE 2: op_auth_type must be strictly Motor Carrier of Property (Except Household Goods)
+        auth_type = sc.get("op_auth_type", target_auth_type)
+        if target_auth_type not in auth_type:
+            continue
+
+        docket = sc.get("docket_number") or cd.get("docket1", "")
+        if docket and cd.get("docket1prefix") and not docket.startswith(cd.get("docket1prefix")):
             docket = f"{cd.get('docket1prefix')}{docket}"
 
-        classdef = cd.get("classdef") or "AUTHORIZED FOR HIRE"
-        
-        # Ensure Motor Carrier of Property (Except Household Goods) or standard property carrier
         merged = {
             "usdot_number": dot,
             "docket_number": docket or "—",
             "legal_name": legal_name,
             "dba_name": cd.get("dba_name") or "—",
             "add_date": add_date,
-            "status_change_date": cd.get("mcs150_date", add_date),
-            "op_auth_status": "ACTIVE" if cd.get("status_code") == "A" else "PENDING",
-            "reason": "Initial Registration",
-            "op_auth_type": classdef,
-            "phone": cd.get("phone") or cd.get("cell_phone") or "—",
-            "email_address": cd.get("email_address") or "—",
+            "status_change_date": sc.get("status_change_date") or add_date,
+            "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
+            "reason": sc.get("reason") or "Initial Registration",
+            "op_auth_type": target_auth_type,
+            "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
+            "email_address": cd.get("email_address") or "N/A",
             "phy_street": cd.get("phy_street") or "",
             "phy_city": cd.get("phy_city") or "",
             "phy_state": cd.get("phy_state") or "",
             "phy_zip": cd.get("phy_zip") or "",
             "power_units": int(cd.get("power_units") or 1),
             "drivers": int(cd.get("total_drivers") or cd.get("total_cdl") or 1),
-            "classdef": classdef,
+            "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
         }
         verified_ventures.append(merged)
 
-    verified_ventures.sort(key=lambda x: x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(verified_ventures)} verified new ventures.")
+    verified_ventures.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
+    print(f"[+] Successfully processed {len(verified_ventures)} strict Motor Carrier of Property new ventures.")
     return verified_ventures
 
 HTML_TEMPLATE = """
@@ -353,7 +380,7 @@ HTML_TEMPLATE = """
                         <div class="mb-3">
                             <label class="form-label small fw-bold text-muted">Timeframe</label>
                             <select id="daysSelect" class="form-select form-select-sm" onchange="loadData()">
-                                <option value="1" selected>Last 1 Day (Daily Batch)</option>
+                                <option value="1" selected>Last 1 Day</option>
                             </select>
                         </div>
 
