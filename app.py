@@ -3,58 +3,23 @@ from flask import Flask, render_template_string, request, jsonify, send_file
 import requests
 import pandas as pd
 from datetime import datetime
-import math
 
 app = Flask(__name__)
 
 CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
-STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
-
-def fetch_status_change_dates(dot_numbers):
-    """
-    Fetch the latest 'Pending' status change date for each DOT number from the status changes dataset.
-    """
-    if not dot_numbers:
-        return {}
-
-    # Build a comma-separated quoted string for SQL IN clause
-    in_clause = "(" + ",".join([f"'{d}'" for d in dot_numbers]) + ")"
-    params = {
-        "$where": f"dot_number in {in_clause} AND status_code = 'P'",
-        "$order": "status_date DESC",
-        "$limit": 10000
-    }
-    try:
-        resp = requests.get(STATUS_CHANGE_URL, params=params)
-        resp.raise_for_status()
-        status_data = resp.json()
-    except Exception as e:
-        print(f"[!] Error fetching status changes: {e}")
-        return {}
-
-    # Since we ordered by status_date DESC, the first occurrence per DOT is the latest
-    latest_status = {}
-    for item in status_data:
-        dot = item.get("dot_number")
-        status_date = item.get("status_date")
-        if dot and status_date:
-            if dot not in latest_status:
-                latest_status[dot] = status_date
-    return latest_status
 
 def fetch_new_ventures():
     """
-    Precision New Ventures Engine (strict filters):
-    1. Latest add_date strictly before today (business-day fallback)
+    Precision New Ventures Engine - Strictly filters by add_date (registration date)
+    1. Finds the latest add_date strictly before today (weekend/business-day fallback)
     2. Status: Pending (status_code = 'P')
     3. Operation type: Motor Carrier of Property (Except Household Goods)
-    4. add_date must be in 2026
-    5. status_change_date enriched from the STATUS_CHANGE_URL endpoint
+    4. add_date must be in 2026 (brand new ventures)
     """
     today_str = datetime.now().strftime('%Y%m%d')
-    print(f"[*] Today: {today_str}. Fetching latest pending carriers of property before today...")
+    print(f"[*] Today: {today_str}. Fetching latest batch based on add_date (registration date)...")
 
-    # ---- Step 1: Get the most recent add_date that meets all criteria ----
+    # ---- Step 1: Get the most recent add_date (registration date) ----
     where_clause = (
         f"status_code = 'P' "
         f"AND operation_classification = 'Motor Carrier of Property (Except Household Goods)' "
@@ -71,7 +36,7 @@ def fetch_new_ventures():
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
-        print(f"[!] Error fetching latest date: {e}")
+        print(f"[!] Error fetching latest add_date: {e}")
         return []
 
     if not data:
@@ -83,9 +48,9 @@ def fetch_new_ventures():
         print(f"[!] Latest add_date {latest_add_date} is not in 2026. Aborting.")
         return []
 
-    print(f"[+] Found latest batch date: {latest_add_date}")
+    print(f"[+] Found latest new-venture registration date: {latest_add_date}")
 
-    # ---- Step 2: Fetch all records for that exact date ----
+    # ---- Step 2: Fetch all records with that exact add_date ----
     all_carriers = []
     limit = 1000
     offset = 0
@@ -116,22 +81,14 @@ def fetch_new_ventures():
             break
         offset += limit
 
-    print(f"[+] Retrieved {len(all_carriers)} candidate carriers from {latest_add_date}.")
+    print(f"[+] Retrieved {len(all_carriers)} true new ventures from batch {latest_add_date}.")
 
-    # ---- Step 3: Fetch status change dates for these DOT numbers ----
-    dot_numbers = [cd.get("dot_number") for cd in all_carriers if cd.get("dot_number")]
-    status_dates = fetch_status_change_dates(dot_numbers)
-
-    # ---- Step 4: Process and format each record ----
+    # ---- Step 3: Process and format each record ----
     verified_ventures = []
     for cd in all_carriers:
         dot = cd.get("dot_number")
         legal_name = cd.get("legal_name", "").strip()
         if not dot or not legal_name:
-            continue
-
-        add_date = cd.get("add_date", "")
-        if not add_date.startswith("2026"):
             continue
 
         # Build docket number
@@ -144,8 +101,8 @@ def fetch_new_ventures():
             "docket_number": docket or "—",
             "legal_name": legal_name,
             "dba_name": cd.get("dba_name") or "—",
-            "add_date": add_date,
-            "status_change_date": status_dates.get(dot, cd.get("mcs150_date", add_date)),
+            "add_date": cd.get("add_date", ""),
+            "status_change_date": cd.get("mcs150_date", ""),  # Kept for reference, but never used as filter
             "op_auth_status": "PENDING",
             "reason": "Initial Registration",
             "op_auth_type": "Motor Carrier of Property (Except Household Goods)",
@@ -166,7 +123,7 @@ def fetch_new_ventures():
     return verified_ventures
 
 
-# ---------- HTML TEMPLATE (unchanged, matches your UI) ----------
+# ---------- HTML TEMPLATE (UI unchanged) ----------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -406,7 +363,7 @@ HTML_TEMPLATE = """
                         <div class="mb-3">
                             <label class="form-label small fw-bold text-muted">Timeframe</label>
                             <select id="daysSelect" class="form-select form-select-sm" disabled>
-                                <option selected>Latest available batch</option>
+                                <option selected>Latest available batch (by add_date)</option>
                             </select>
                         </div>
 
@@ -553,7 +510,7 @@ HTML_TEMPLATE = """
                     <td>
                         <div class="fw-bold text-dark">${item.legal_name}</div>
                         ${item.dba_name && item.dba_name !== '—' ? `<small class="text-muted">d/b/a ${item.dba_name}</small>` : ''}
-                        <div><span class="badge bg-light text-secondary border font-monospace" style="font-size:0.65rem;">${item.add_date}</span></div>
+                        <div><span class="badge bg-light text-secondary border font-monospace" style="font-size:0.65rem;">Added: ${item.add_date}</span></div>
                     </td>
                     <td><span class="font-monospace fw-bold">${item.usdot_number}</span></td>
                     <td><span class="font-monospace">${item.docket_number}</span></td>
