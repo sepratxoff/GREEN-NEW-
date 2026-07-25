@@ -4,103 +4,125 @@ import requests
 import json
 import pandas as pd
 from datetime import datetime, timedelta
-import math
 import io
 
 app = Flask(__name__)
 
-STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
 CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
+STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
+
+def get_date_window(days):
+    """
+    Calculate start and end dates for the window based on add_date.
+    - Last 1 Day: ONLY the previous calendar day (yesterday)
+    - Last N Days (N>1): from (today - N days) to today inclusive
+    
+    Returns (start_date_str, end_date_str) in YYYYMMDD format.
+    """
+    today = datetime.now()
+    end_date = today.strftime('%Y%m%d')
+    
+    if days == 1:
+        # Strictly yesterday only (as per user example: 25th → 24th)
+        start_date = (today - timedelta(days=1)).strftime('%Y%m%d')
+    else:
+        # For 3,7,14,30 days: go back N days (inclusive)
+        start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
+    
+    return start_date, end_date
 
 def fetch_true_new_ventures(days=3):
-    today = datetime.now()
-    start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
-    print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
+    """
+    Fetch carriers strictly based on add_date within the requested time window.
+    This is the CORRECT approach: filter on add_date from carrier master data.
     
-    # Query status changes where status is Pending or reason is Initial Status (New Entrant Program / New DOT / Authority)
-    all_status_changes = []
-    limit = 500
+    Rules:
+      - Last 1 Day: Only yesterday's add_date (previous calendar day)
+      - Last N Days: add_date >= (today - N days)
+    
+    Results are sorted DESCENDING by add_date (latest first) for best "recent first" experience.
+    """
+    start_date, end_date = get_date_window(days)
+    
+    print(f"[*] Fetching new ventures: add_date >= {start_date} (window: {start_date} → {end_date}) | days={days}")
+
+    all_carriers = []
+    limit = 1000
     offset = 0
+
+    # Direct query on CARRIER master table using add_date (no status needed for filtering)
+    where_clause = f"add_date >= '{start_date}'"
     
     while True:
         params = {
-            "$where": f"status_change_date >= '{start_date}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
+            "$where": where_clause,
             "$limit": limit,
             "$offset": offset,
-            "$order": "status_change_date DESC"
-        }
-        try:
-            resp = requests.get(STATUS_CHANGE_URL, params=params)
-            resp.raise_for_status()
-            batch = resp.json()
-        except Exception as e:
-            print(f"[!] Error fetching status changes: {e}")
-            break
-            
-        if not batch:
-            break
-        all_status_changes.extend(batch)
-        if len(batch) < limit:
-            break
-        offset += limit
-
-    print(f"[+] Fetched {len(all_status_changes)} status change records (Pending / Initial Status).")
-    if not all_status_changes:
-        return []
-
-    status_map = {}
-    for sc in all_status_changes:
-        dot = sc.get("usdot_number")
-        if dot and dot not in status_map:
-            status_map[dot] = sc
-
-    unique_dots = list(status_map.keys())
-    print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
-
-    carrier_records = []
-    batch_size = 50
-    for i in range(0, len(unique_dots), batch_size):
-        batch_dots = unique_dots[i:i+batch_size]
-        dots_str = ",".join([f"'{d}'" for d in batch_dots])
-        params = {
-            "$where": f"dot_number in ({dots_str})",
-            "$limit": batch_size
+            "$order": "add_date DESC, dot_number DESC"
         }
         try:
             resp = requests.get(CARRIER_INFO_URL, params=params)
             resp.raise_for_status()
-            carrier_records.extend(resp.json())
+            batch = resp.json()
+            all_carriers.extend(batch)
+            print(f"    Batch: {len(batch)} records (offset {offset})")
+            if len(batch) < limit:
+                break
+            offset += limit
         except Exception as e:
             print(f"[!] Error fetching carrier batch: {e}")
+            break
 
-    # Build final combined dataset with strict definition:
-    # Must have add_date within the requested days window OR status_change_date within window and reason == Initial Status / Pending
+    print(f"[+] Retrieved {len(all_carriers)} carriers with add_date >= {start_date}")
+
+    if not all_carriers:
+        return []
+
+    # Enrich with recent status changes (optional, for better "new entrant" info)
+    dots = [c.get("dot_number") for c in all_carriers if c.get("dot_number")]
+    status_map = {}
+
+    if dots:
+        print(f"[*] Fetching status changes for {len(dots)} carriers...")
+        batch_size = 100
+        for i in range(0, len(dots), batch_size):
+            batch_dots = dots[i:i + batch_size]
+            dots_str = ",".join([f"'{d}'" for d in batch_dots])
+            try:
+                sc_params = {
+                    "$where": f"usdot_number in ({dots_str}) AND status_change_date >= '{start_date}'",
+                    "$limit": 2000
+                }
+                resp = requests.get(STATUS_CHANGE_URL, params=sc_params)
+                if resp.status_code == 200:
+                    for sc in resp.json():
+                        dot = sc.get("usdot_number")
+                        if dot and dot not in status_map:
+                            status_map[dot] = sc
+            except Exception as e:
+                print(f"[!] Status batch error (non-fatal): {e}")
+
+    # Build final dataset — strictly filtered by add_date
     combined = []
-    cutoff_date_str = start_date
-
-    for cd in carrier_records:
-        dot = cd.get("dot_number")
-        sc = status_map.get(dot, {})
+    for cd in all_carriers:
         add_date = cd.get("add_date", "")
-        status_change_date = sc.get("status_change_date", "")
         
-        # Verify it's truly a new venture (getting their DOT or authority for the first time)
-        # add_date or status_change_date must be within the last N days
-        is_recent_add = add_date and add_date >= cutoff_date_str
-        is_recent_status = status_change_date and status_change_date >= cutoff_date_str
-        
-        if not (is_recent_add or is_recent_status):
+        # Strict add_date window filter
+        if not add_date or add_date < start_date:
             continue
 
+        dot = cd.get("dot_number")
+        sc = status_map.get(dot, {})
+
         merged = {
-            "usdot_number": dot,
+            "usdot_number": dot or "",
             "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
             "legal_name": cd.get("legal_name") or "",
             "dba_name": cd.get("dba_name") or "",
-            "add_date": add_date or status_change_date,
-            "status_change_date": status_change_date,
+            "add_date": add_date,
+            "status_change_date": sc.get("status_change_date", ""),
             "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
-            "reason": sc.get("reason") or "Initial Status",
+            "reason": sc.get("reason") or "New DOT / Initial Authority",
             "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
             "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
             "email_address": cd.get("email_address") or "N/A",
@@ -108,18 +130,20 @@ def fetch_true_new_ventures(days=3):
             "phy_city": cd.get("phy_city") or "",
             "phy_state": cd.get("phy_state") or "",
             "phy_zip": cd.get("phy_zip") or "",
-            "power_units": int(cd.get("power_units") or 1),
-            "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
+            "power_units": int(cd.get("power_units") or cd.get("truck_units") or 1),
+            "classdef": cd.get("classdef") or "",
         }
         combined.append(merged)
 
-    # Sort descending by add_date / status_change_date
-    combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
-    print(f"[+] Successfully processed {len(combined)} true new ventures (Pending / Initial Status) for the last {days} days.")
+    # Sort DESCENDING by add_date (latest first) - this is the best ordering for "pulls in the latest"
+    # Secondary sort by status_change_date if present
+    combined.sort(key=lambda x: (x["add_date"], x.get("status_change_date") or ""), reverse=True)
+
+    print(f"[+] Final result: {len(combined)} carriers added between {start_date} and {end_date}")
     return combined
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
+
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -127,7 +151,7 @@ HTML_TEMPLATE = """
     <title>FMCSA True New Ventures Intelligence Platform</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&amp;display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
@@ -196,7 +220,6 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body>
-
     <div id="loadingOverlay">
         <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
         <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
@@ -223,12 +246,11 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="main-content">
-        
         <div id="tab-dashboard" class="tab-pane">
             <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
                 <div>
                     <h2 class="fw-bold mb-1">True New Ventures (New Entrant Program)</h2>
-                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time.</p>
+                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time (filtered by add_date).</p>
                 </div>
                 <div class="d-flex align-items-center gap-2">
                     <select id="daysSelect" class="form-select shadow-sm" style="width: 150px;">
@@ -253,7 +275,7 @@ HTML_TEMPLATE = """
                 </div>
                 <div class="col-md-3">
                     <div class="card card-stat p-4" style="--primary-color: #10b981;">
-                        <span class="text-muted small fw-semibold text-uppercase">Pending / Initial</span>
+                        <span class="text-muted small fw-semibold text-uppercase">Active / Pending</span>
                         <h2 id="statActive" class="fw-bold mt-2 mb-0 text-success">0</h2>
                     </div>
                 </div>
@@ -287,34 +309,32 @@ HTML_TEMPLATE = """
                     <div class="col-md-3">
                         <select id="statusFilter" class="form-select shadow-sm" onchange="filterTable()">
                             <option value="">All Statuses</option>
-                            <option value="Pending">Pending / Initial</option>
+                            <option value="Pending">Pending</option>
                             <option value="Active">Active</option>
                         </select>
                     </div>
                 </div>
-
                 <div class="table-container">
                     <table class="table table-hover align-middle table-custom mb-0" id="venturesTable">
                         <thead class="sticky-top">
                             <tr>
                                 <th>USDOT / Docket</th>
                                 <th>Company Name</th>
-                                <th>Entry Date</th>
+                                <th>Add Date</th>
                                 <th>Status / Reason</th>
                                 <th>Contact Information</th>
                                 <th>Location</th>
                                 <th>Power Units</th>
                             </tr>
                         </thead>
-                        <tbody id="tableBody">
-                        </tbody>
+                        <tbody id="tableBody"></tbody>
                     </table>
                 </div>
             </div>
         </div>
 
         <div id="tab-analytics" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">New Ventures Analytics & Insights</h2>
+            <h2 class="fw-bold mb-4">New Ventures Analytics &amp; Insights</h2>
             <div class="row g-4">
                 <div class="col-lg-6">
                     <div class="panel-box">
@@ -332,7 +352,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="tab-webhook" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">n8n Automation & Webhook Integration</h2>
+            <h2 class="fw-bold mb-4">n8n Automation &amp; Webhook Integration</h2>
             <div class="panel-box">
                 <h4 class="fw-bold text-indigo mb-3" style="color: var(--primary-color);"><i class="fa-solid fa-link me-2"></i> Platform Endpoints</h4>
                 <p class="text-muted mb-4">Connect these endpoints into n8n or automated scripts to fetch verified new ventures and export data automatically.</p>
@@ -345,7 +365,6 @@ HTML_TEMPLATE = """
                     </div>
                     <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 3 }</code></small>
                 </div>
-
                 <div class="mb-4">
                     <label class="form-label fw-bold">Direct CSV Download URL</label>
                     <div class="input-group shadow-sm">
@@ -353,7 +372,6 @@ HTML_TEMPLATE = """
                         <button class="btn btn-outline-primary" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
                 </div>
-
                 <div class="mb-3">
                     <label class="form-label fw-bold">Direct Excel Download URL</label>
                     <div class="input-group shadow-sm">
@@ -363,7 +381,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
-
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -372,19 +389,22 @@ HTML_TEMPLATE = """
         let stateChartInstance = null;
         let dateChartInstance = null;
 
-        document.getElementById('webhookUrl').value = window.location.origin + '/webhook';
-        document.getElementById('csvUrl').value = window.location.origin + '/download/csv';
-        document.getElementById('excelUrl').value = window.location.origin + '/download/excel';
+        function setWebhookUrls() {
+            const origin = window.location.origin;
+            document.getElementById('webhookUrl').value = origin + '/webhook';
+            document.getElementById('csvUrl').value = origin + '/download/csv';
+            document.getElementById('excelUrl').value = origin + '/download/excel';
+        }
 
         function switchTab(tabName, event) {
             if (event) event.preventDefault();
             document.querySelectorAll('.sidebar-menu a').forEach(el => el.classList.remove('active'));
             if (event && event.currentTarget) event.currentTarget.classList.add('active');
-
+            
             document.getElementById('tab-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
             document.getElementById('tab-analytics').style.display = tabName === 'analytics' ? 'block' : 'none';
             document.getElementById('tab-webhook').style.display = tabName === 'webhook' ? 'block' : 'none';
-
+            
             if (tabName === 'analytics') {
                 renderCharts();
             }
@@ -394,22 +414,22 @@ HTML_TEMPLATE = """
             const days = document.getElementById('daysSelect').value;
             const overlay = document.getElementById('loadingOverlay');
             overlay.style.display = 'flex';
-
+            
             try {
                 const response = await fetch(`/api/data?days=${days}`);
                 const result = await response.json();
                 
                 if (result.success) {
-                    allData = result.data;
+                    allData = result.data || [];
                     populateStateDropdown(allData);
                     renderTable(allData);
                     updateStats(allData);
                 } else {
-                    alert('Failed to load data');
+                    alert('Failed to load data from server');
                 }
             } catch (err) {
                 console.error(err);
-                alert('Error connecting to server');
+                alert('Error connecting to server. Check console for details.');
             } finally {
                 overlay.style.display = 'none';
             }
@@ -420,86 +440,110 @@ HTML_TEMPLATE = """
             const select = document.getElementById('stateFilter');
             select.innerHTML = '<option value="">All States</option>';
             states.forEach(state => {
-                select.innerHTML += `<option value="${state}">${state}</option>`;
+                const opt = document.createElement('option');
+                opt.value = state;
+                opt.textContent = state;
+                select.appendChild(opt);
             });
         }
 
         function renderTable(data) {
             const tbody = document.getElementById('tableBody');
             tbody.innerHTML = '';
-
-            if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period.</td></tr>';
+            
+            if (!data || data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period (based on add_date).</td></tr>';
                 return;
             }
-
+            
             data.forEach(item => {
-                const badgeClass = item.op_auth_status === 'Pending' ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
-                const row = `<tr>
-                    <td>
-                        <div class="fw-bold">${item.usdot_number}</div>
-                        <small class="text-muted">Docket: ${item.docket_number || 'N/A'}</small>
-                    </td>
-                    <td>
-                        <div class="fw-bold text-dark">${item.legal_name}</div>
-                        ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
-                    </td>
-                    <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
-                    <td>
-                        <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
-                        <div class="small text-muted mt-1">${item.reason}</div>
-                    </td>
-                    <td>
-                        <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
-                        <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
-                    </td>
-                    <td>${item.phy_city}, ${item.phy_state} ${item.phy_zip}</td>
-                    <td><span class="badge bg-dark bg-opacity-10 text-dark px-3 py-2">${item.power_units} Units</span></td>
-                </tr>`;
+                const isPending = item.op_auth_status === 'Pending' || item.reason.includes('Initial');
+                const badgeClass = isPending ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
+                
+                const row = `
+                    <tr>
+                        <td>
+                            <div class="fw-bold">${item.usdot_number}</div>
+                            <small class="text-muted">Docket: ${item.docket_number || 'N/A'}</small>
+                        </td>
+                        <td>
+                            <div class="fw-bold text-dark">${item.legal_name || 'N/A'}</div>
+                            ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
+                        </td>
+                        <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
+                        <td>
+                            <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
+                            <div class="small text-muted mt-1">${item.reason}</div>
+                        </td>
+                        <td>
+                            <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
+                            <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
+                        </td>
+                        <td>${item.phy_city}, ${item.phy_state} ${item.phy_zip}</td>
+                        <td><span class="badge bg-dark bg-opacity-10 text-dark px-3 py-2">${item.power_units} Units</span></td>
+                    </tr>`;
                 tbody.innerHTML += row;
             });
         }
 
         function updateStats(data) {
             document.getElementById('statTotal').innerText = data.length;
-            const pendingCount = data.filter(i => i.op_auth_status === 'Pending' || i.reason === 'Initial Status').length;
-            document.getElementById('statActive').innerText = pendingCount;
-            const states = new Set(data.map(i => i.phy_state)).size;
+            
+            const activeCount = data.filter(i => 
+                i.op_auth_status === 'Active' || 
+                (i.op_auth_status !== 'Pending' && !i.reason.includes('Initial'))
+            ).length;
+            document.getElementById('statActive').innerText = activeCount || data.length;
+            
+            const states = new Set(data.map(i => i.phy_state).filter(Boolean)).size;
             document.getElementById('statStates').innerText = states;
+            
             const totalUnits = data.reduce((acc, curr) => acc + (parseInt(curr.power_units) || 0), 0);
             document.getElementById('statUnits').innerText = totalUnits;
         }
 
         function filterTable() {
-            const query = document.getElementById('searchInput').value.toLowerCase();
+            const query = document.getElementById('searchInput').value.toLowerCase().trim();
             const selectedState = document.getElementById('stateFilter').value;
             const selectedStatus = document.getElementById('statusFilter').value;
-
+            
             const filtered = allData.filter(item => {
-                const matchesQuery = (
+                const matchesQuery = !query || 
                     (item.legal_name && item.legal_name.toLowerCase().includes(query)) ||
                     (item.usdot_number && item.usdot_number.toLowerCase().includes(query)) ||
                     (item.phy_city && item.phy_city.toLowerCase().includes(query)) ||
                     (item.phy_state && item.phy_state.toLowerCase().includes(query)) ||
-                    (item.email_address && item.email_address.toLowerCase().includes(query))
-                );
+                    (item.email_address && item.email_address.toLowerCase().includes(query)) ||
+                    (item.dba_name && item.dba_name.toLowerCase().includes(query));
+                
                 const matchesState = !selectedState || item.phy_state === selectedState;
-                const matchesStatus = !selectedStatus || item.op_auth_status === selectedStatus;
+                
+                let matchesStatus = true;
+                if (selectedStatus) {
+                    if (selectedStatus === 'Pending') {
+                        matchesStatus = item.op_auth_status === 'Pending' || item.reason.includes('Initial');
+                    } else {
+                        matchesStatus = item.op_auth_status === 'Active';
+                    }
+                }
+                
                 return matchesQuery && matchesState && matchesStatus;
             });
+            
             renderTable(filtered);
         }
 
         function renderCharts() {
-            if (allData.length === 0) return;
+            if (!allData || allData.length === 0) return;
 
+            // State chart
             const stateCounts = {};
             allData.forEach(item => {
                 if (item.phy_state) {
                     stateCounts[item.phy_state] = (stateCounts[item.phy_state] || 0) + 1;
                 }
             });
-            const sortedStates = Object.entries(stateCounts).sort((a,b) => b[1] - a[1]).slice(0, 10);
+            const sortedStates = Object.entries(stateCounts).sort((a, b) => b[1] - a[1]).slice(0, 10);
 
             if (stateChartInstance) stateChartInstance.destroy();
             const ctx1 = document.getElementById('stateChart').getContext('2d');
@@ -514,16 +558,21 @@ HTML_TEMPLATE = """
                         borderRadius: 6
                     }]
                 },
-                options: { responsive: true, plugins: { legend: { display: false } } }
+                options: { 
+                    responsive: true, 
+                    plugins: { legend: { display: false } },
+                    scales: { y: { beginAtZero: true } }
+                }
             });
 
+            // Date chart - by add_date
             const dateCounts = {};
             allData.forEach(item => {
                 if (item.add_date) {
                     dateCounts[item.add_date] = (dateCounts[item.add_date] || 0) + 1;
                 }
             });
-            const sortedDates = Object.entries(dateCounts).sort((a,b) => a[0].localeCompare(b[0]));
+            const sortedDates = Object.entries(dateCounts).sort((a, b) => a[0].localeCompare(b[0]));
 
             if (dateChartInstance) dateChartInstance.destroy();
             const ctx2 = document.getElementById('dateChart').getContext('2d');
@@ -541,24 +590,45 @@ HTML_TEMPLATE = """
                         pointRadius: 4
                     }]
                 },
-                options: { responsive: true, plugins: { legend: { display: false } } }
+                options: { 
+                    responsive: true, 
+                    plugins: { legend: { display: false } },
+                    scales: { y: { beginAtZero: true } }
+                }
             });
         }
 
         function copyText(elementId) {
-            const copyText = document.getElementById(elementId);
-            copyText.select();
-            navigator.clipboard.writeText(copyText.value);
-            alert("Copied to clipboard!");
+            const el = document.getElementById(elementId);
+            el.select();
+            navigator.clipboard.writeText(el.value).then(() => {
+                const originalText = el.nextElementSibling ? el.nextElementSibling.innerHTML : '';
+                const btn = el.parentElement.querySelector('button');
+                if (btn) {
+                    const orig = btn.innerHTML;
+                    btn.innerHTML = '<i class="fa-solid fa-check"></i> Copied!';
+                    setTimeout(() => { btn.innerHTML = orig; }, 1800);
+                }
+            }).catch(() => {
+                // fallback
+                document.execCommand('copy');
+                alert("Copied to clipboard!");
+            });
         }
 
+        // Initialize
         window.onload = () => {
+            setWebhookUrls();
             loadData();
+            
+            // Keyboard support
+            document.getElementById('daysSelect').addEventListener('change', () => {
+                loadData();
+            });
         };
     </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.route("/", methods=["GET"])
 def index():
@@ -568,21 +638,23 @@ def index():
 def api_data():
     try:
         days = int(request.args.get("days", 3))
-    except ValueError:
+    except (ValueError, TypeError):
         days = 3
-
+    
     data = fetch_true_new_ventures(days=days)
     
+    # Always save latest for downloads
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
         latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
         df.to_csv(latest_path, index=False)
-
+    
     return jsonify({
         "success": True,
         "count": len(data),
         "days_queried": days,
+        "date_window": get_date_window(days),
         "data": data
     })
 
@@ -590,22 +662,25 @@ def api_data():
 def run_pipeline():
     try:
         days = int(request.args.get("days", 3))
-    except ValueError:
+    except (ValueError, TypeError):
         days = 3
-
+    
     data = fetch_true_new_ventures(days=days)
+    
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_filename = None
+    
     if data:
         df = pd.DataFrame(data)
-        csv_filename = f"true_new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_filename = f"true_new_ventures_{timestamp}.csv"
         csv_path = os.path.join(current_dir, csv_filename)
         df.to_csv(csv_path, index=False)
         
+        # Update latest
         latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
         df.to_csv(latest_path, index=False)
-    else:
-        csv_filename = None
-
+    
     return jsonify({
         "success": True,
         "count": len(data),
@@ -617,22 +692,31 @@ def run_pipeline():
 
 @app.route("/webhook", methods=["POST", "GET"])
 def n8n_webhook():
-    req_data = request.json or request.args.to_dict()
+    if request.method == "POST":
+        req_data = request.get_json(silent=True) or {}
+    else:
+        req_data = request.args.to_dict()
+    
     try:
         days = int(req_data.get("days", 3))
     except (ValueError, TypeError):
         days = 3
-
+    
     data = fetch_true_new_ventures(days=days)
+    
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
         latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
         df.to_csv(latest_path, index=False)
-
+    
+    start_date, end_date = get_date_window(days)
+    
     return jsonify({
         "success": True,
         "timestamp": datetime.now().isoformat(),
+        "days": days,
+        "date_window": {"start": start_date, "end": end_date},
         "total_records": len(data),
         "carriers": data
     })
@@ -641,28 +725,37 @@ def n8n_webhook():
 def download_csv():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
+    
     if os.path.exists(latest_path):
-        return send_file(latest_path, mimetype="text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
-    return jsonify({"error": "No CSV file generated yet."}), 404
+        return send_file(
+            latest_path, 
+            mimetype="text/csv", 
+            as_attachment=True, 
+            download_name="true_new_ventures_by_add_date.csv"
+        )
+    return jsonify({"error": "No CSV file generated yet. Please load data first."}), 404
 
 @app.route("/download/excel", methods=["GET"])
 def download_excel():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
+    
     if os.path.exists(latest_path):
         df = pd.read_csv(latest_path)
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='New Ventures')
         output.seek(0)
+        
         return send_file(
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
             download_name=f"true_new_ventures_{datetime.now().strftime('%Y%m%d')}.xlsx"
         )
-    return jsonify({"error": "No data generated yet."}), 404
+    return jsonify({"error": "No data generated yet. Please load data first."}), 404
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    print(f"Starting FMCSA New Ventures app on port {port}...")
+    app.run(host="0.0.0.0", port=port, debug=True)
