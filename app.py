@@ -1,184 +1,107 @@
 import os
 from flask import Flask, render_template_string, request, jsonify, send_file
 import requests
+import json
 import pandas as pd
 from datetime import datetime, timedelta
+import math
+import io
 
 app = Flask(__name__)
 
-CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
 STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
+CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
 
-# =============================================================================
-# STRICT DATE LOGIC
-# =============================================================================
-
-def get_previous_business_day(from_date=None):
-    """
-    Get the previous business day (Mon-Fri).
-    - Monday -> Friday
-    - Sunday -> Friday
-    - Saturday -> Friday
-    - Otherwise -> Yesterday
-    """
-    if from_date is None:
-        from_date = datetime.now()
-
-    target = from_date - timedelta(days=1)
-    while target.weekday() >= 5:  # 5=Saturday, 6=Sunday
-        target -= timedelta(days=1)
-    return target
-
-def get_date_range(days, from_date=None):
-    """
-    Calculate the strict date range for queries.
-    - days=1: Returns (previous_business_day, previous_business_day)
-    - days=7: Returns (previous_business_day - 6 days, previous_business_day)
-    - days=14: Returns (previous_business_day - 13 days, previous_business_day)
-    """
-    end_date = get_previous_business_day(from_date)
-    start_date = end_date - timedelta(days=days - 1)
-    return start_date, end_date
-
-# =============================================================================
-# STATUS CHANGE FETCHING
-# =============================================================================
-
-def fetch_status_change_dates(dot_numbers):
-    """
-    Fetch the latest 'Pending' status change date for each DOT.
-    """
-    if not dot_numbers:
-        return {}
-
-    in_clause = "(" + ",".join([f"'{d}'" for d in dot_numbers]) + ")"
-    params = {
-        "$where": f"dot_number in {in_clause} AND status_code = 'P'",
-        "$order": "status_date DESC",
-        "$limit": 10000
-    }
-    try:
-        resp = requests.get(STATUS_CHANGE_URL, params=params, timeout=60)
-        resp.raise_for_status()
-        status_data = resp.json()
-    except Exception as e:
-        print(f"[!] Error fetching status changes: {e}")
-        return {}
-
-    latest_status = {}
-    for item in status_data:
-        dot = item.get("dot_number")
-        status_date = item.get("status_date")
-        if dot and status_date and dot not in latest_status:
-            latest_status[dot] = status_date
-    return latest_status
-
-# =============================================================================
-# STRICT CARRIER FETCHING
-# =============================================================================
-
-def fetch_new_ventures(days=1):
-    """
-    STRICT New Ventures Engine.
-
-    Filters (ALWAYS applied):
-      - status_code = 'P' (Pending)
-      - operation_classification = 'Motor Carrier of Property (Except Household Goods)'
-
-    Date Logic:
-      - 1-day: Previous business day ONLY (e.g., if today is 25th Jul Sat, fetch 24th Jul Fri)
-      - 7-day: Last 7 calendar days ending on previous business day
-      - 14-day: Last 14 calendar days ending on previous business day
-
-    Validation:
-      - All returned records are verified to have the exact requested add_date(s)
-      - Only 2026 records are accepted
-    """
+def fetch_true_new_ventures(days=3):
     today = datetime.now()
-    start_date, end_date = get_date_range(days, today)
-
-    start_str = start_date.strftime('%Y%m%d')
-    end_str = end_date.strftime('%Y%m%d')
-
-    print(f"[*] Today: {today.strftime('%Y-%m-%d %A')}")
-    print(f"[*] Mode: LAST {days} DAY(S)")
-    print(f"[*] Fetching add_date from {start_str} to {end_str}")
-    print(f"[*] Strict Filters: status_code='P' | op_class='Motor Carrier of Property (Except Household Goods)'")
-
-    all_carriers = []
-    limit = 1000
+    start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
+    print(f"[*] Fetching true new ventures since {start_date} (last {days} days)...")
+    
+    # Query status changes where status is Pending or reason is Initial Status (New Entrant Program / New DOT / Authority)
+    all_status_changes = []
+    limit = 500
     offset = 0
-
-    # STRICT where clause - NEVER changes
-    where_clause = (
-        f"status_code = 'P' "
-        f"AND operation_classification = 'Motor Carrier of Property (Except Household Goods)' "
-        f"AND add_date >= '{start_str}' AND add_date <= '{end_str}'"
-    )
-
+    
     while True:
         params = {
-            "$where": where_clause,
+            "$where": f"status_change_date >= '{start_date}' AND (op_auth_status = 'Pending' OR reason = 'Initial Status')",
             "$limit": limit,
             "$offset": offset,
-            "$order": "add_date DESC"
+            "$order": "status_change_date DESC"
         }
         try:
-            resp = requests.get(CARRIER_INFO_URL, params=params, timeout=60)
+            resp = requests.get(STATUS_CHANGE_URL, params=params)
             resp.raise_for_status()
             batch = resp.json()
         except Exception as e:
-            print(f"[!] API error during pagination: {e}")
+            print(f"[!] Error fetching status changes: {e}")
             break
-
+            
         if not batch:
             break
-
-        # STRICT VALIDATION: Only accept records that match our exact date range and year 2026
-        for record in batch:
-            add_date = record.get('add_date', '')
-            if add_date and add_date.startswith('2026') and start_str <= add_date <= end_str:
-                all_carriers.append(record)
-            else:
-                print(f"[!] FILTERED OUT record with add_date={add_date} (outside {start_str}-{end_str})")
-
+        all_status_changes.extend(batch)
         if len(batch) < limit:
             break
         offset += limit
 
-    print(f"[+] Strictly validated {len(all_carriers)} new ventures from {start_str} to {end_str}.")
-    return process_carriers(all_carriers)
+    print(f"[+] Fetched {len(all_status_changes)} status change records (Pending / Initial Status).")
+    if not all_status_changes:
+        return []
 
-# =============================================================================
-# DATA PROCESSING
-# =============================================================================
+    status_map = {}
+    for sc in all_status_changes:
+        dot = sc.get("usdot_number")
+        if dot and dot not in status_map:
+            status_map[dot] = sc
 
-def process_carriers(carrier_list):
-    """Format and enrich carrier data."""
-    dot_numbers = [cd.get("dot_number") for cd in carrier_list if cd.get("dot_number")]
-    status_dates = fetch_status_change_dates(dot_numbers)
+    unique_dots = list(status_map.keys())
+    print(f"[*] Fetching carrier master profiles for {len(unique_dots)} unique USDOTs...")
 
-    verified_ventures = []
-    for cd in carrier_list:
+    carrier_records = []
+    batch_size = 50
+    for i in range(0, len(unique_dots), batch_size):
+        batch_dots = unique_dots[i:i+batch_size]
+        dots_str = ",".join([f"'{d}'" for d in batch_dots])
+        params = {
+            "$where": f"dot_number in ({dots_str})",
+            "$limit": batch_size
+        }
+        try:
+            resp = requests.get(CARRIER_INFO_URL, params=params)
+            resp.raise_for_status()
+            carrier_records.extend(resp.json())
+        except Exception as e:
+            print(f"[!] Error fetching carrier batch: {e}")
+
+    # Build final combined dataset with strict definition:
+    # Must have add_date within the requested days window OR status_change_date within window and reason == Initial Status / Pending
+    combined = []
+    cutoff_date_str = start_date
+
+    for cd in carrier_records:
         dot = cd.get("dot_number")
-        legal_name = cd.get("legal_name", "").strip()
-        if not dot or not legal_name:
+        sc = status_map.get(dot, {})
+        add_date = cd.get("add_date", "")
+        status_change_date = sc.get("status_change_date", "")
+        
+        # Verify it's truly a new venture (getting their DOT or authority for the first time)
+        # add_date or status_change_date must be within the last N days
+        is_recent_add = add_date and add_date >= cutoff_date_str
+        is_recent_status = status_change_date and status_change_date >= cutoff_date_str
+        
+        if not (is_recent_add or is_recent_status):
             continue
-
-        docket = cd.get("docket1", "")
-        if docket and cd.get("docket1prefix"):
-            docket = f"{cd.get('docket1prefix')}{docket}"
 
         merged = {
             "usdot_number": dot,
-            "docket_number": docket or "—",
-            "legal_name": legal_name,
-            "dba_name": cd.get("dba_name") or "—",
-            "add_date": cd.get("add_date", ""),
-            "status_change_date": status_dates.get(dot, cd.get("mcs150_date", "")),
-            "op_auth_status": "PENDING",
-            "reason": "Initial Registration",
-            "op_auth_type": "Motor Carrier of Property (Except Household Goods)",
+            "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
+            "legal_name": cd.get("legal_name") or "",
+            "dba_name": cd.get("dba_name") or "",
+            "add_date": add_date or status_change_date,
+            "status_change_date": status_change_date,
+            "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
+            "reason": sc.get("reason") or "Initial Status",
+            "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
             "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
             "email_address": cd.get("email_address") or "N/A",
             "phy_street": cd.get("phy_street") or "",
@@ -186,17 +109,14 @@ def process_carriers(carrier_list):
             "phy_state": cd.get("phy_state") or "",
             "phy_zip": cd.get("phy_zip") or "",
             "power_units": int(cd.get("power_units") or 1),
-            "drivers": int(cd.get("total_drivers") or cd.get("total_cdl") or 1),
             "classdef": cd.get("classdef") or "AUTHORIZED FOR HIRE",
         }
-        verified_ventures.append(merged)
+        combined.append(merged)
 
-    verified_ventures.sort(key=lambda x: x["add_date"], reverse=True)
-    return verified_ventures
-
-# =============================================================================
-# HTML TEMPLATE
-# =============================================================================
+    # Sort descending by add_date / status_change_date
+    combined.sort(key=lambda x: x["status_change_date"] if x["status_change_date"] else x["add_date"], reverse=True)
+    print(f"[+] Successfully processed {len(combined)} true new ventures (Pending / Initial Status) for the last {days} days.")
+    return combined
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -204,195 +124,270 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GreenSearch — FMCSA True New Ventures</title>
+    <title>FMCSA True New Ventures Intelligence Platform</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
-            --font-main: 'Plus Jakarta Sans', sans-serif;
-            --brand-green: #10b981;
-            --brand-green-hover: #059669;
-            --body-bg: #f8fafc;
-            --text-dark: #0f172a;
-            --text-muted: #64748b;
-            --border-color: #e2e8f0;
+            --bs-body-font-family: 'Inter', sans-serif;
+            --sidebar-width: 260px;
+            --primary-color: #4f46e5;
+            --bg-color: #f8fafc;
         }
-        body { font-family: var(--font-main); background-color: var(--body-bg); color: var(--text-dark); overflow-x: hidden; }
-        .navbar-green { background: #ffffff; border-bottom: 1px solid var(--border-color); padding: 0.85rem 2rem; }
-        .navbar-brand { font-weight: 800; font-size: 1.25rem; color: var(--text-dark); display: flex; align-items: center; gap: 10px; text-decoration: none; }
-        .navbar-brand .logo-badge { background: var(--brand-green); color: white; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 8px; font-size: 1rem; }
-        .nav-link { font-weight: 600; color: var(--text-muted); text-decoration: none; transition: color 0.2s; cursor: pointer; }
-        .nav-link:hover, .nav-link.active { color: var(--brand-green); }
-        .hero-section { background: #ffffff; border-bottom: 1px solid var(--border-color); padding: 2.5rem 1.5rem; text-align: center; }
-        .hero-title { font-weight: 800; font-size: 2.25rem; color: var(--text-dark); letter-spacing: -0.02em; margin-bottom: 0.5rem; }
-        .hero-subtitle { color: var(--text-muted); font-size: 1rem; margin-bottom: 1.5rem; }
-        .main-container { max-width: 1440px; margin: 2rem auto; padding: 0 1.5rem; }
-        .filter-card { background: #ffffff; border: 1px solid var(--border-color); border-radius: 14px; padding: 1.5rem; box-shadow: 0 2px 10px rgba(0,0,0,0.02); }
-        .filter-title { font-weight: 700; font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dark); margin-bottom: 1rem; }
-        .table-card { background: #ffffff; border: 1px solid var(--border-color); border-radius: 14px; box-shadow: 0 2px 10px rgba(0,0,0,0.02); overflow: hidden; }
-        .table-header-bar { padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; background: #fff; }
-        .table-custom { margin-bottom: 0; white-space: nowrap; }
-        .table-custom th { font-weight: 700; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); background: #f8fafc !important; border-bottom: 1px solid var(--border-color); padding: 12px 16px; }
-        .table-custom td { padding: 14px 16px; vertical-align: middle; color: var(--text-dark); border-bottom: 1px solid var(--border-color); font-size: 0.9rem; }
-        .table-container { max-height: 600px; overflow-y: auto; }
-        .status-badge { font-weight: 700; font-size: 0.7rem; padding: 5px 10px; border-radius: 6px; letter-spacing: 0.05em; }
-        .badge-pending { background: rgba(245, 158, 11, 0.15); color: #d97706; }
-        .btn-green { background: var(--brand-green); color: #fff; border: none; font-weight: 600; padding: 0.5rem 1rem; border-radius: 8px; transition: background 0.2s; }
-        .btn-green:hover { background: var(--brand-green-hover); color: #fff; }
-        .date-badge { background: #ecfdf5; color: #059669; border: 1px solid #a7f3d0; font-weight: 700; font-size: 0.75rem; padding: 4px 10px; border-radius: 6px; }
-        #loadingOverlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(4px); z-index: 9999; justify-content: center; align-items: center; flex-direction: column; gap: 15px; color: #fff; }
-        .info-bar { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 0.75rem 1rem; margin-bottom: 1rem; font-size: 0.85rem; color: #166534; }
+        body { background-color: var(--bg-color); color: #1e293b; overflow-x: hidden; }
+        .sidebar {
+            width: var(--sidebar-width);
+            height: 100vh;
+            position: fixed;
+            top: 0; left: 0;
+            background: #0f172a;
+            color: #94a3b8;
+            z-index: 1000;
+            box-shadow: 4px 0 10px rgba(0,0,0,0.05);
+        }
+        .sidebar-brand {
+            font-size: 1.25rem; font-weight: 700; color: #fff;
+            padding: 1.5rem 1.25rem; display: flex; align-items: center; gap: 10px;
+            border-bottom: 1px solid #1e293b;
+        }
+        .sidebar-menu { padding: 1.25rem 0.75rem; list-style: none; margin: 0; }
+        .sidebar-menu li { margin-bottom: 0.5rem; }
+        .sidebar-menu a {
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 14px; color: #94a3b8; text-decoration: none;
+            font-weight: 500; border-radius: 8px; transition: all 0.2s ease;
+        }
+        .sidebar-menu a:hover, .sidebar-menu a.active {
+            background: var(--primary-color); color: #fff;
+            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
+        }
+        .main-content { margin-left: var(--sidebar-width); padding: 2.5rem; min-height: 100vh; }
+        .card-stat {
+            background: #fff; border: none; border-radius: 14px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.03); position: relative; overflow: hidden;
+        }
+        .card-stat::after {
+            content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
+            background: var(--primary-color);
+        }
+        .panel-box {
+            background: #fff; border: none; border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.03); padding: 1.75rem; margin-bottom: 2rem;
+        }
+        .table-custom th {
+            font-weight: 600; color: #475569; background: #f8fafc !important;
+            border-bottom: 2px solid #e2e8f0; padding: 12px 16px; white-space: nowrap;
+        }
+        .table-custom td { padding: 14px 16px; vertical-align: middle; color: #334155; white-space: nowrap; }
+        .table-container { max-height: 650px; overflow-y: auto; border-radius: 12px; border: 1px solid #e2e8f0; }
+        #loadingOverlay {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(255, 255, 255, 0.85); z-index: 9999;
+            justify-content: center; align-items: center; flex-direction: column; gap: 15px;
+        }
+        .badge-status { padding: 6px 12px; border-radius: 20px; font-weight: 500; font-size: 0.75rem; }
+        @media (max-width: 992px) {
+            .sidebar { width: 70px; }
+            .sidebar .sidebar-brand span, .sidebar .sidebar-menu span, .sidebar .sidebar-footer { display: none; }
+            .main-content { margin-left: 70px; padding: 1.5rem; }
+        }
     </style>
 </head>
 <body>
+
     <div id="loadingOverlay">
-        <div class="spinner-border text-light" style="width: 3.5rem; height: 3.5rem;" role="status"></div>
-        <h4 class="fw-bold mt-3">Loading New Ventures...</h4>
-        <p class="text-light opacity-75 small">Connecting to FMCSA live registry database...</p>
+        <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
+        <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
+        <p class="text-muted small">Fetching newly issued USDOTs and Initial Status authorities...</p>
     </div>
 
-    <nav class="navbar navbar-green navbar-expand-lg">
-        <div class="container-fluid px-3">
-            <a class="navbar-brand" href="#">
-                <div class="logo-badge"><i class="fa-solid fa-bolt"></i></div>
-                <span>GreenSearch</span>
-            </a>
-            <div class="d-flex align-items-center gap-4">
-                <a href="#" class="nav-link active" onclick="switchTab('dashboard', event)">Dashboard</a>
-                <a href="#" class="nav-link" onclick="switchTab('webhook', event)">API / Webhook</a>
-                <a href="/download/csv" class="btn btn-green btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
+    <div class="sidebar d-flex flex-column justify-content-between">
+        <div>
+            <div class="sidebar-brand">
+                <i class="fa-solid fa-truck-fast text-indigo" style="color: #6366f1;"></i>
+                <span>NewVentures</span>
             </div>
+            <ul class="sidebar-menu">
+                <li><a href="#" class="active" onclick="switchTab('dashboard', event)"><i class="fa-solid fa-chart-pie fa-fw"></i> <span>Dashboard</span></a></li>
+                <li><a href="#" onclick="switchTab('analytics', event)"><i class="fa-solid fa-chart-column fa-fw"></i> <span>Analytics</span></a></li>
+                <li><a href="#" onclick="switchTab('webhook', event)"><i class="fa-solid fa-bolt fa-fw"></i> <span>n8n Webhooks</span></a></li>
+                <li><a href="/download/csv" target="_blank"><i class="fa-solid fa-file-csv fa-fw"></i> <span>Export CSV</span></a></li>
+                <li><a href="/download/excel" target="_blank"><i class="fa-solid fa-file-excel fa-fw"></i> <span>Export Excel</span></a></li>
+            </ul>
         </div>
-    </nav>
-
-    <section class="hero-section">
-        <div class="container">
-            <h1 class="hero-title">Look up any FMCSA new venture</h1>
-            <p class="hero-subtitle">Free, public motor‑carrier data — search by name, DOT#, MC#, location, cargo, or contact.</p>
+        <div class="p-3 m-3 rounded bg-dark border border-secondary text-center sidebar-footer">
+            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> New Entrant Verified</small>
         </div>
-    </section>
+    </div>
 
-    <div class="main-container">
-        <div id="tab-dashboard">
-            <div class="row g-4">
-                <div class="col-lg-3">
-                    <div class="filter-card">
-                        <div class="d-flex justify-content-between align-items-center mb-3">
-                            <span class="filter-title mb-0">Filters</span>
-                            <a href="#" class="text-success text-decoration-none small fw-semibold" onclick="resetFilters()">Reset all</a>
-                        </div>
+    <div class="main-content">
+        
+        <div id="tab-dashboard" class="tab-pane">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
+                <div>
+                    <h2 class="fw-bold mb-1">True New Ventures (New Entrant Program)</h2>
+                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time.</p>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <select id="daysSelect" class="form-select shadow-sm" style="width: 150px;">
+                        <option value="1">Last 1 Day</option>
+                        <option value="3" selected>Last 3 Days</option>
+                        <option value="7">Last 7 Days</option>
+                        <option value="14">Last 14 Days</option>
+                        <option value="30">Last 30 Days</option>
+                    </select>
+                    <button class="btn btn-primary shadow-sm px-4 d-flex align-items-center gap-2" onclick="loadData()" style="background-color: var(--primary-color); border: none;">
+                        <i class="fa-solid fa-rotate"></i> Refresh
+                    </button>
+                </div>
+            </div>
 
-                        <div class="mb-3">
-                            <label class="form-label small fw-bold text-muted">Timeframe</label>
-                            <select id="daysSelect" class="form-select form-select-sm" onchange="loadData()">
-                                <option value="1">Latest Batch (Previous Business Day)</option>
-                                <option value="7">Last 7 Days</option>
-                                <option value="14">Last 14 Days</option>
-                            </select>
-                        </div>
+            <div class="row g-4 mb-4">
+                <div class="col-md-3">
+                    <div class="card card-stat p-4">
+                        <span class="text-muted small fw-semibold text-uppercase">New Entrants</span>
+                        <h2 id="statTotal" class="fw-bold mt-2 mb-0 text-dark">0</h2>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card card-stat p-4" style="--primary-color: #10b981;">
+                        <span class="text-muted small fw-semibold text-uppercase">Pending / Initial</span>
+                        <h2 id="statActive" class="fw-bold mt-2 mb-0 text-success">0</h2>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card card-stat p-4" style="--primary-color: #0ea5e9;">
+                        <span class="text-muted small fw-semibold text-uppercase">States Covered</span>
+                        <h2 id="statStates" class="fw-bold mt-2 mb-0 text-info">0</h2>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card card-stat p-4" style="--primary-color: #f59e0b;">
+                        <span class="text-muted small fw-semibold text-uppercase">Total Power Units</span>
+                        <h2 id="statUnits" class="fw-bold mt-2 mb-0 text-warning">0</h2>
+                    </div>
+                </div>
+            </div>
 
-                        <div class="mb-3">
-                            <label class="form-label small fw-bold text-muted">State</label>
-                            <select id="stateFilter" class="form-select form-select-sm" onchange="filterTable()">
-                                <option value="">All States</option>
-                            </select>
+            <div class="panel-box">
+                <div class="row g-3 mb-4">
+                    <div class="col-md-6">
+                        <div class="input-group shadow-sm">
+                            <span class="input-group-text bg-white border-end-0"><i class="fa-solid fa-search text-muted"></i></span>
+                            <input type="text" id="searchInput" class="form-control border-start-0" placeholder="Search company name, USDOT, city, email..." onkeyup="filterTable()">
                         </div>
-
-                        <div class="mb-3">
-                            <label class="form-label small fw-bold text-muted">Status</label>
-                            <select id="statusFilter" class="form-select form-select-sm" onchange="filterTable()">
-                                <option value="">All Statuses</option>
-                                <option value="PENDING">Pending</option>
-                            </select>
-                        </div>
-
-                        <div class="mt-4 pt-3 border-top">
-                            <small class="text-muted d-block mb-1"><i class="fa-solid fa-circle-info me-1"></i> Active Filters</small>
-                            <div class="d-flex flex-wrap gap-1" id="activeFilters">
-                                <span class="date-badge"><i class="fa-solid fa-filter me-1"></i>Status: PENDING</span>
-                                <span class="date-badge"><i class="fa-solid fa-truck me-1"></i>Motor Carrier of Property</span>
-                            </div>
-                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <select id="stateFilter" class="form-select shadow-sm" onchange="filterTable()">
+                            <option value="">All States</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <select id="statusFilter" class="form-select shadow-sm" onchange="filterTable()">
+                            <option value="">All Statuses</option>
+                            <option value="Pending">Pending / Initial</option>
+                            <option value="Active">Active</option>
+                        </select>
                     </div>
                 </div>
 
-                <div class="col-lg-9">
-                    <div class="info-bar d-flex align-items-center gap-2">
-                        <i class="fa-solid fa-calendar-check"></i>
-                        <span id="dateInfo">Loading date range...</span>
+                <div class="table-container">
+                    <table class="table table-hover align-middle table-custom mb-0" id="venturesTable">
+                        <thead class="sticky-top">
+                            <tr>
+                                <th>USDOT / Docket</th>
+                                <th>Company Name</th>
+                                <th>Entry Date</th>
+                                <th>Status / Reason</th>
+                                <th>Contact Information</th>
+                                <th>Location</th>
+                                <th>Power Units</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-analytics" class="tab-pane" style="display: none;">
+            <h2 class="fw-bold mb-4">New Ventures Analytics & Insights</h2>
+            <div class="row g-4">
+                <div class="col-lg-6">
+                    <div class="panel-box">
+                        <h5 class="fw-bold mb-3">Top 10 States for New Registrations</h5>
+                        <canvas id="stateChart" height="250"></canvas>
                     </div>
-
-                    <div class="table-card">
-                        <div class="table-header-bar">
-                            <div class="w-50">
-                                <input type="text" id="searchInput" class="form-control form-control-sm" placeholder="Search company name, USDOT, city, email..." onkeyup="filterTable()">
-                            </div>
-                            <div class="d-flex gap-2">
-                                <span id="resultCount" class="text-muted small fw-semibold align-self-center me-2">Showing 0 results</span>
-                                <a href="/download/csv" class="btn btn-green btn-sm" target="_blank"><i class="fa-solid fa-download me-1"></i> Export CSV</a>
-                            </div>
-                        </div>
-
-                        <div class="table-container">
-                            <table class="table table-hover align-middle table-custom" id="venturesTable">
-                                <thead class="sticky-top">
-                                    <tr>
-                                        <th>Carrier</th>
-                                        <th>DOT #</th>
-                                        <th>MC#</th>
-                                        <th>Location</th>
-                                        <th>Power Units</th>
-                                        <th>Status</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="tableBody">
-                                </tbody>
-                            </table>
-                        </div>
+                </div>
+                <div class="col-lg-6">
+                    <div class="panel-box">
+                        <h5 class="fw-bold mb-3">Registration Volume by Date</h5>
+                        <canvas id="dateChart" height="250"></canvas>
                     </div>
                 </div>
             </div>
         </div>
 
         <div id="tab-webhook" class="tab-pane" style="display: none;">
-            <div class="filter-card">
-                <h4 class="fw-bold text-success mb-3"><i class="fa-solid fa-link me-2"></i> n8n Webhook & API Endpoints</h4>
-                <p class="text-muted mb-4">Use these endpoints to integrate your GreenSearch platform into n8n or automated scripts.</p>
-
+            <h2 class="fw-bold mb-4">n8n Automation & Webhook Integration</h2>
+            <div class="panel-box">
+                <h4 class="fw-bold text-indigo mb-3" style="color: var(--primary-color);"><i class="fa-solid fa-link me-2"></i> Platform Endpoints</h4>
+                <p class="text-muted mb-4">Connect these endpoints into n8n or automated scripts to fetch verified new ventures and export data automatically.</p>
+                
                 <div class="mb-4">
-                    <label class="form-label fw-bold small">Webhook URL (POST / GET)</label>
+                    <label class="form-label fw-bold">Webhook URL (POST / GET)</label>
                     <div class="input-group shadow-sm">
                         <input type="text" class="form-control font-monospace bg-light" id="webhookUrl" value="" readonly>
-                        <button class="btn btn-outline-success" onclick="copyText('webhookUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
+                        <button class="btn btn-outline-primary" onclick="copyText('webhookUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
-                    <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 7 }</code></small>
+                    <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 3 }</code></small>
                 </div>
 
                 <div class="mb-4">
-                    <label class="form-label fw-bold small">Direct CSV Download URL</label>
+                    <label class="form-label fw-bold">Direct CSV Download URL</label>
                     <div class="input-group shadow-sm">
                         <input type="text" class="form-control font-monospace bg-light" id="csvUrl" value="" readonly>
-                        <button class="btn btn-outline-success" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
+                        <button class="btn btn-outline-primary" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
+                    </div>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label fw-bold">Direct Excel Download URL</label>
+                    <div class="input-group shadow-sm">
+                        <input type="text" class="form-control font-monospace bg-light" id="excelUrl" value="" readonly>
+                        <button class="btn btn-outline-primary" onclick="copyText('excelUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
                     </div>
                 </div>
             </div>
         </div>
+
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         let allData = [];
+        let stateChartInstance = null;
+        let dateChartInstance = null;
 
         document.getElementById('webhookUrl').value = window.location.origin + '/webhook';
         document.getElementById('csvUrl').value = window.location.origin + '/download/csv';
+        document.getElementById('excelUrl').value = window.location.origin + '/download/excel';
 
         function switchTab(tabName, event) {
             if (event) event.preventDefault();
-            document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.sidebar-menu a').forEach(el => el.classList.remove('active'));
             if (event && event.currentTarget) event.currentTarget.classList.add('active');
+
             document.getElementById('tab-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
+            document.getElementById('tab-analytics').style.display = tabName === 'analytics' ? 'block' : 'none';
             document.getElementById('tab-webhook').style.display = tabName === 'webhook' ? 'block' : 'none';
+
+            if (tabName === 'analytics') {
+                renderCharts();
+            }
         }
 
         async function loadData() {
@@ -403,15 +398,14 @@ HTML_TEMPLATE = """
             try {
                 const response = await fetch(`/api/data?days=${days}`);
                 const result = await response.json();
-
+                
                 if (result.success) {
                     allData = result.data;
-                    document.getElementById('dateInfo').innerHTML = 
-                        `<strong>Date Range:</strong> ${result.date_range.start} → ${result.date_range.end} &nbsp;|&nbsp; <strong>Business Day Logic:</strong> ${result.date_range.note}`;
                     populateStateDropdown(allData);
                     renderTable(allData);
+                    updateStats(allData);
                 } else {
-                    alert('Failed to load data: ' + (result.error || 'Unknown error'));
+                    alert('Failed to load data');
                 }
             } catch (err) {
                 console.error(err);
@@ -433,28 +427,47 @@ HTML_TEMPLATE = """
         function renderTable(data) {
             const tbody = document.getElementById('tableBody');
             tbody.innerHTML = '';
-            document.getElementById('resultCount').innerText = `Showing ${data.length} results`;
 
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-5">No new ventures found for this period.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period.</td></tr>';
                 return;
             }
 
             data.forEach(item => {
+                const badgeClass = item.op_auth_status === 'Pending' ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
                 const row = `<tr>
                     <td>
-                        <div class="fw-bold text-dark">${item.legal_name}</div>
-                        ${item.dba_name && item.dba_name !== '—' ? `<small class="text-muted">d/b/a ${item.dba_name}</small>` : ''}
-                        <div><span class="badge bg-light text-secondary border font-monospace" style="font-size:0.65rem;">Added: ${item.add_date}</span></div>
+                        <div class="fw-bold">${item.usdot_number}</div>
+                        <small class="text-muted">Docket: ${item.docket_number || 'N/A'}</small>
                     </td>
-                    <td><span class="font-monospace fw-bold">${item.usdot_number}</span></td>
-                    <td><span class="font-monospace">${item.docket_number}</span></td>
-                    <td>${item.phy_city}, ${item.phy_state}</td>
-                    <td><span class="fw-semibold">${item.power_units}</span></td>
-                    <td><span class="status-badge badge-pending">${item.op_auth_status}</span></td>
+                    <td>
+                        <div class="fw-bold text-dark">${item.legal_name}</div>
+                        ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
+                    </td>
+                    <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
+                    <td>
+                        <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
+                        <div class="small text-muted mt-1">${item.reason}</div>
+                    </td>
+                    <td>
+                        <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
+                        <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
+                    </td>
+                    <td>${item.phy_city}, ${item.phy_state} ${item.phy_zip}</td>
+                    <td><span class="badge bg-dark bg-opacity-10 text-dark px-3 py-2">${item.power_units} Units</span></td>
                 </tr>`;
                 tbody.innerHTML += row;
             });
+        }
+
+        function updateStats(data) {
+            document.getElementById('statTotal').innerText = data.length;
+            const pendingCount = data.filter(i => i.op_auth_status === 'Pending' || i.reason === 'Initial Status').length;
+            document.getElementById('statActive').innerText = pendingCount;
+            const states = new Set(data.map(i => i.phy_state)).size;
+            document.getElementById('statStates').innerText = states;
+            const totalUnits = data.reduce((acc, curr) => acc + (parseInt(curr.power_units) || 0), 0);
+            document.getElementById('statUnits').innerText = totalUnits;
         }
 
         function filterTable() {
@@ -466,7 +479,6 @@ HTML_TEMPLATE = """
                 const matchesQuery = (
                     (item.legal_name && item.legal_name.toLowerCase().includes(query)) ||
                     (item.usdot_number && item.usdot_number.toLowerCase().includes(query)) ||
-                    (item.docket_number && item.docket_number.toLowerCase().includes(query)) ||
                     (item.phy_city && item.phy_city.toLowerCase().includes(query)) ||
                     (item.phy_state && item.phy_state.toLowerCase().includes(query)) ||
                     (item.email_address && item.email_address.toLowerCase().includes(query))
@@ -478,11 +490,59 @@ HTML_TEMPLATE = """
             renderTable(filtered);
         }
 
-        function resetFilters() {
-            document.getElementById('searchInput').value = '';
-            document.getElementById('stateFilter').value = '';
-            document.getElementById('statusFilter').value = '';
-            loadData();
+        function renderCharts() {
+            if (allData.length === 0) return;
+
+            const stateCounts = {};
+            allData.forEach(item => {
+                if (item.phy_state) {
+                    stateCounts[item.phy_state] = (stateCounts[item.phy_state] || 0) + 1;
+                }
+            });
+            const sortedStates = Object.entries(stateCounts).sort((a,b) => b[1] - a[1]).slice(0, 10);
+
+            if (stateChartInstance) stateChartInstance.destroy();
+            const ctx1 = document.getElementById('stateChart').getContext('2d');
+            stateChartInstance = new Chart(ctx1, {
+                type: 'bar',
+                data: {
+                    labels: sortedStates.map(i => i[0]),
+                    datasets: [{
+                        label: 'New Ventures',
+                        data: sortedStates.map(i => i[1]),
+                        backgroundColor: '#4f46e5',
+                        borderRadius: 6
+                    }]
+                },
+                options: { responsive: true, plugins: { legend: { display: false } } }
+            });
+
+            const dateCounts = {};
+            allData.forEach(item => {
+                if (item.add_date) {
+                    dateCounts[item.add_date] = (dateCounts[item.add_date] || 0) + 1;
+                }
+            });
+            const sortedDates = Object.entries(dateCounts).sort((a,b) => a[0].localeCompare(b[0]));
+
+            if (dateChartInstance) dateChartInstance.destroy();
+            const ctx2 = document.getElementById('dateChart').getContext('2d');
+            dateChartInstance = new Chart(ctx2, {
+                type: 'line',
+                data: {
+                    labels: sortedDates.map(i => i[0]),
+                    datasets: [{
+                        label: 'Registrations',
+                        data: sortedDates.map(i => i[1]),
+                        borderColor: '#06b6d4',
+                        backgroundColor: 'rgba(6, 182, 212, 0.1)',
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 4
+                    }]
+                },
+                options: { responsive: true, plugins: { legend: { display: false } } }
+            });
         }
 
         function copyText(elementId) {
@@ -500,21 +560,19 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# =============================================================================
-# FLASK ROUTES
-# =============================================================================
-
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 @app.route("/api/data", methods=["GET"])
 def api_data():
-    days = request.args.get('days', default=1, type=int)
-    data = fetch_new_ventures(days=days)
+    try:
+        days = int(request.args.get("days", 3))
+    except ValueError:
+        days = 3
 
-    start_date, end_date = get_date_range(days)
-
+    data = fetch_true_new_ventures(days=days)
+    
     current_dir = os.path.dirname(os.path.abspath(__file__))
     if data:
         df = pd.DataFrame(data)
@@ -525,28 +583,24 @@ def api_data():
         "success": True,
         "count": len(data),
         "days_queried": days,
-        "date_range": {
-            "start": start_date.strftime('%Y-%m-%d'),
-            "end": end_date.strftime('%Y-%m-%d'),
-            "note": "Weekends auto-skip to previous Friday"
-        },
         "data": data
     })
 
 @app.route("/run", methods=["GET", "POST"])
 def run_pipeline():
-    days = request.args.get('days', default=1, type=int)
-    data = fetch_new_ventures(days=days)
+    try:
+        days = int(request.args.get("days", 3))
+    except ValueError:
+        days = 3
+
+    data = fetch_true_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-
-    start_date, end_date = get_date_range(days)
-
     if data:
         df = pd.DataFrame(data)
-        csv_filename = f"new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_filename = f"true_new_ventures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = os.path.join(current_dir, csv_filename)
         df.to_csv(csv_path, index=False)
-
+        
         latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
         df.to_csv(latest_path, index=False)
     else:
@@ -556,10 +610,6 @@ def run_pipeline():
         "success": True,
         "count": len(data),
         "days_queried": days,
-        "date_range": {
-            "start": start_date.strftime('%Y-%m-%d'),
-            "end": end_date.strftime('%Y-%m-%d')
-        },
         "csv_file": csv_filename,
         "download_url": "/download/csv",
         "data": data
@@ -567,17 +617,14 @@ def run_pipeline():
 
 @app.route("/webhook", methods=["POST", "GET"])
 def n8n_webhook():
-    if request.is_json:
-        data_payload = request.get_json()
-        days = data_payload.get('days', 1)
-    else:
-        days = request.args.get('days', default=1, type=int)
+    req_data = request.json or request.args.to_dict()
+    try:
+        days = int(req_data.get("days", 3))
+    except (ValueError, TypeError):
+        days = 3
 
-    data = fetch_new_ventures(days=days)
+    data = fetch_true_new_ventures(days=days)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-
-    start_date, end_date = get_date_range(days)
-
     if data:
         df = pd.DataFrame(data)
         latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
@@ -586,11 +633,6 @@ def n8n_webhook():
     return jsonify({
         "success": True,
         "timestamp": datetime.now().isoformat(),
-        "days_queried": days,
-        "date_range": {
-            "start": start_date.strftime('%Y-%m-%d'),
-            "end": end_date.strftime('%Y-%m-%d')
-        },
         "total_records": len(data),
         "carriers": data
     })
@@ -602,6 +644,24 @@ def download_csv():
     if os.path.exists(latest_path):
         return send_file(latest_path, mimetype="text/csv", as_attachment=True, download_name="true_new_ventures_sorted.csv")
     return jsonify({"error": "No CSV file generated yet."}), 404
+
+@app.route("/download/excel", methods=["GET"])
+def download_excel():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
+    if os.path.exists(latest_path):
+        df = pd.read_csv(latest_path)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='New Ventures')
+        output.seek(0)
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f"true_new_ventures_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        )
+    return jsonify({"error": "No data generated yet."}), 404
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
