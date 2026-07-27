@@ -11,6 +11,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 app = Flask(__name__)
+APP_NAME = "GreenVentures"
+APP_VERSION = "3.0.0-ui-n8n"
 
 # Official FMCSA / DOT sources used by the n8n workflow.
 CENSUS_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
@@ -385,66 +387,7 @@ def get_or_generate(days):
     return result
 
 
-HTML_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>FMCSA Verified New Ventures</title>
-  <style>
-    body{font-family:Arial,sans-serif;margin:0;background:#f4f7fb;color:#172033}
-    header{background:#111827;color:white;padding:22px 30px}
-    main{padding:24px;max-width:1500px;margin:auto}
-    .controls,.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
-    button,select{padding:10px 14px;border-radius:8px;border:1px solid #ccd4e0}
-    button{background:#4f46e5;color:white;border:0;cursor:pointer}
-    .card{background:white;padding:16px;border-radius:12px;min-width:210px;box-shadow:0 3px 14px #0000000b}
-    .card b{font-size:26px;display:block;margin-top:8px}
-    .note{background:#fff8dc;border-left:4px solid #d99c00;padding:12px;margin-bottom:18px}
-    .table-wrap{overflow:auto;background:white;border-radius:12px;box-shadow:0 3px 14px #0000000b}
-    table{border-collapse:collapse;width:100%;font-size:13px}
-    th,td{padding:10px;border-bottom:1px solid #e6ebf2;text-align:left;white-space:nowrap}
-    th{position:sticky;top:0;background:#eef2ff}
-    .ok{color:#087f5b;font-weight:bold}.loading{opacity:.55;pointer-events:none}
-  </style>
-</head>
-<body>
-<header><h2>FMCSA Verified New Ventures</h2></header>
-<main id="app">
-  <div class="note">“No insurance history” means no record was found in the checked FMCSA datasets at the verification time. It does not prove that no non-FMCSA or intrastate policy exists.</div>
-  <div class="controls">
-    <select id="days"><option value="1">Previous 1 day</option><option value="3" selected>Previous 3 days</option><option value="7">Previous 7 days</option><option value="14">Previous 14 days</option><option value="30">Previous 30 days</option></select>
-    <button onclick="loadData()">Refresh official FMCSA data</button>
-    <button onclick="location.href='/download/csv'">Download CSV</button>
-    <button onclick="location.href='/download/excel'">Download Excel</button>
-  </div>
-  <div class="cards">
-    <div class="card">Strict New DOT candidates<b id="initial">–</b></div>
-    <div class="card">Excluded for insurance<b id="insurance">–</b></div>
-    <div class="card">Excluded for New Entrant OOS<b id="oos">–</b></div>
-    <div class="card">Final qualified list<b id="final">–</b></div>
-  </div>
-  <p id="window"></p>
-  <div class="table-wrap"><table><thead><tr><th>USDOT</th><th>Company</th><th>Add date</th><th>Phone</th><th>Email</th><th>Location</th><th>Power units</th><th>Insurance</th><th>New Entrant/OOS</th></tr></thead><tbody id="rows"></tbody></table></div>
-</main>
-<script>
-async function loadData(){
- const app=document.getElementById('app'); app.classList.add('loading');
- try{
-  const d=document.getElementById('days').value;
-  const r=await fetch('/api/data?days='+d); const x=await r.json();
-  if(!r.ok||!x.success) throw new Error(x.error||'Request failed');
-  document.getElementById('initial').textContent=x.counts.strict_new_dot_candidates;
-  document.getElementById('insurance').textContent=x.counts.excluded_for_current_pending_or_previous_insurance;
-  document.getElementById('oos').textContent=x.counts.excluded_for_new_entrant_oos;
-  document.getElementById('final').textContent=x.counts.final_verified_candidates;
-  document.getElementById('window').textContent=`Date window: ${x.date_window.start_inclusive} through the day before ${x.date_window.end_exclusive} (${x.date_window.timezone})`;
-  document.getElementById('rows').innerHTML=x.carriers.map(c=>`<tr><td>${c.usdot_number}</td><td>${c.legal_name||''}</td><td>${c.add_date}</td><td>${c.phone||''}</td><td>${c.email_address||''}</td><td>${c.phy_city||''}, ${c.phy_state||''}</td><td>${c.power_units}</td><td class="ok">No FMCSA history found</td><td class="ok">Candidate; no OOS found</td></tr>`).join('');
- }catch(e){alert(e.message)}finally{app.classList.remove('loading')}
-}
-window.onload=loadData;
-</script>
-</body></html>"""
+HTML_TEMPLATE = '<!doctype html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width,initial-scale=1">\n  <title>GreenVentures • FMCSA New Venture Intelligence</title>\n  <style>\n    :root{--navy:#07111f;--navy2:#0d1b2e;--ink:#172033;--muted:#64748b;--line:#e5eaf1;--bg:#f3f6fb;--white:#fff;--green:#10b981;--blue:#4f46e5;--cyan:#0891b2;--amber:#f59e0b;--red:#ef4444}\n    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}\n    .layout{display:grid;grid-template-columns:258px 1fr;min-height:100vh}.side{background:linear-gradient(180deg,var(--navy),var(--navy2));color:#cbd5e1;padding:24px 18px;position:sticky;top:0;height:100vh}\n    .brand{display:flex;align-items:center;gap:12px;color:#fff;font-weight:800;font-size:20px;padding:4px 7px 26px}.logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,#6366f1,#06b6d4);box-shadow:0 8px 25px #4f46e555}\n    .nav-title{font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:#64748b;margin:18px 10px 8px}.nav-item{display:flex;gap:11px;align-items:center;padding:11px 12px;border-radius:10px;margin:4px 0;color:#b7c2d2;text-decoration:none}.nav-item:hover{background:#ffffff0b;color:#fff}.nav-item.active{background:#ffffff12;color:#fff}.side-foot{position:absolute;bottom:22px;left:18px;right:18px;border:1px solid #ffffff18;background:#ffffff08;border-radius:12px;padding:13px;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px #10b98122;margin-right:8px}\n    main{padding:30px;min-width:0}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:24px}.top h1{font-size:27px;margin:0 0 7px}.top p{margin:0;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap}select,button,input{font:inherit}.btn,.select{border:1px solid var(--line);background:#fff;border-radius:10px;padding:10px 13px}.btn{cursor:pointer;font-weight:700}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue);box-shadow:0 8px 18px #4f46e52b}.btn:hover{transform:translateY(-1px)}\n    .notice{display:flex;gap:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:13px;padding:13px 15px;color:#854d0e;font-size:13px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin-bottom:20px}.stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 7px 25px #0f172a0a;position:relative;overflow:hidden}.stat:after{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,var(--blue))}.stat small{color:var(--muted);font-weight:700}.stat strong{font-size:28px;display:block;margin-top:8px}.stat span{font-size:12px;color:#94a3b8}\n    .panel{background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 7px 25px #0f172a0a;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 18px;border-bottom:1px solid var(--line)}.panel-head h2{font-size:16px;margin:0}.filters{display:flex;gap:8px}.search{min-width:290px;border:1px solid var(--line);border-radius:9px;padding:9px 11px}.mini{border:1px solid var(--line);border-radius:9px;padding:9px;background:#fff}\n    .table-wrap{overflow:auto;max-height:650px}table{border-collapse:collapse;width:100%;font-size:13px}th{position:sticky;top:0;background:#f8fafc;color:#475569;text-align:left;z-index:1;font-size:11px;text-transform:uppercase;letter-spacing:.05em}th,td{padding:12px 14px;border-bottom:1px solid #edf1f5;white-space:nowrap}tbody tr:hover{background:#fafbff}.name{font-weight:750}.sub{display:block;color:var(--muted);font-size:11px;margin-top:3px}.tag{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:750}.tag.green{background:#d1fae5;color:#047857}.tag.blue{background:#e0e7ff;color:#4338ca}.tag.gray{background:#eef2f7;color:#475569}.empty{text-align:center;padding:50px;color:var(--muted)}\n    .loader{position:fixed;inset:0;background:#07111fcc;display:none;z-index:50;place-items:center;color:#fff;text-align:center}.loader.show{display:grid}.spinner{width:46px;height:46px;border:4px solid #ffffff2b;border-top-color:#818cf8;border-radius:50%;animation:spin .8s linear infinite;margin:auto auto 14px}@keyframes spin{to{transform:rotate(360deg)}}\n    .meta{font-size:12px;color:var(--muted);padding:12px 18px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:12px;padding:13px;display:none;margin-bottom:15px}\n.section-title{display:flex;justify-content:space-between;align-items:end;margin:28px 0 14px}.section-title h2{margin:0;font-size:20px}.section-title p{margin:5px 0 0;color:var(--muted);font-size:13px}.endpoint-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.endpoint-card{background:#fff;border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 7px 25px #0f172a0a}.endpoint-top{display:flex;justify-content:space-between;align-items:center;gap:10px}.method{font-size:10px;font-weight:850;padding:5px 8px;border-radius:7px;background:#e0e7ff;color:#4338ca}.method.get{background:#cffafe;color:#0e7490}.endpoint-card h3{font-size:15px;margin:0}.endpoint-card p{font-size:13px;color:var(--muted);line-height:1.5;min-height:39px}.codebox{background:#07111f;color:#dbeafe;border-radius:10px;padding:12px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0}.copy{border:0;background:#eef2ff;color:#4338ca;font-weight:750;border-radius:8px;padding:7px 9px;cursor:pointer}.payload-label{font-size:11px;font-weight:800;color:#475569;text-transform:uppercase;letter-spacing:.05em}.flow{background:linear-gradient(135deg,#eef2ff,#ecfeff);border:1px solid #c7d2fe;border-radius:14px;padding:16px;margin:15px 0;color:#334155;font-size:13px}.source-list{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.source{background:white;border:1px solid var(--line);padding:12px;border-radius:11px;font-size:12px}.source b{display:block;margin-bottom:4px}.source span{color:var(--muted)}\n    @media(max-width:1100px){.layout{grid-template-columns:82px 1fr}.side{padding:20px 11px}.brand span,.nav-item span,.nav-title,.side-foot{display:none}.brand{justify-content:center}.nav-item{justify-content:center}.grid{grid-template-columns:repeat(2,1fr)}.endpoint-grid{grid-template-columns:1fr}.source-list{grid-template-columns:repeat(2,1fr)}}\n    @media(max-width:720px){.layout{display:block}.side{display:none}main{padding:18px}.top{display:block}.actions{margin-top:15px}.grid{grid-template-columns:1fr}.source-list{grid-template-columns:1fr}.panel-head{display:block}.filters{margin-top:12px;display:grid}.search{min-width:0}.table-wrap{max-height:none}}\n  </style>\n</head>\n<body>\n<div class="loader" id="loader"><div><div class="spinner"></div><b>Screening official FMCSA datasets</b><div class="sub" style="color:#cbd5e1;margin-top:8px">Census → insurance → history → New Entrant OOS</div></div></div>\n<div class="layout">\n  <aside class="side">\n    <div class="brand"><div class="logo">GV</div><span>GreenVentures</span></div>\n    <div class="nav-title">Workspace</div>\n    <a class="nav-item active" href="#dashboard">◫ <span>Verified ventures</span></a>\n    <a class="nav-item" href="#integrations">⌁ <span>n8n & API</span></a>\n    <a class="nav-item" href="#exports">⇩ <span>Exports</span></a>\n    <div class="nav-title">Verification</div>\n    <div class="nav-item">✓ <span>Insurance screening</span></div>\n    <div class="nav-item">✓ <span>New Entrant OOS</span></div>\n    <div class="side-foot"><span class="dot"></span>Official-source pipeline<br><span style="color:#64748b;display:block;margin-top:7px">Daily FMCSA snapshots</span></div>\n  </aside>\n  <main id="dashboard">\n    <div class="top">\n      <div><h1>Verified New Ventures</h1><p>Recent for-hire FMCSA registrations screened for insurance history and New Entrant OOS orders.</p></div>\n      <div class="actions">\n        <select class="select" id="days"><option value="1">Previous 1 day</option><option value="3" selected>Previous 3 days</option><option value="7">Previous 7 days</option><option value="14">Previous 14 days</option><option value="30">Previous 30 days</option></select>\n        <button id="exports" class="btn" onclick="location.href=\'/download/csv\'">CSV</button><button class="btn" onclick="location.href=\'/download/excel\'">Excel</button><button class="btn primary" onclick="loadData()">Refresh data</button>\n      </div>\n    </div>\n    <div class="error" id="error"></div>\n    <div class="notice"><b>Verification meaning</b><span>No current, pending, or previous filing was found in the checked FMCSA insurance datasets at the recorded check time. This does not cover private/non-filed insurance outside FMCSA.</span></div>\n    <section class="grid">\n      <div class="stat" style="--accent:#4f46e5"><small>Initial candidates</small><strong id="initial">–</strong><span>Strict recent Census matches</span></div>\n      <div class="stat" style="--accent:#ef4444"><small>Insurance excluded</small><strong id="insurance">–</strong><span>Current, pending, or previous</span></div>\n      <div class="stat" style="--accent:#f59e0b"><small>OOS excluded</small><strong id="oos">–</strong><span>New Entrant orders found</span></div>\n      <div class="stat" style="--accent:#10b981"><small>Final qualified</small><strong id="final">–</strong><span>Ready for workflow output</span></div>\n    </section>\n    <section class="panel">\n      <div class="panel-head"><h2>Qualified carrier records</h2><div class="filters"><input class="search" id="search" placeholder="Search USDOT, company, city, state…" oninput="render()"><select class="mini" id="state" onchange="render()"><option value="">All states</option></select></div></div>\n      <div class="table-wrap"><table><thead><tr><th>USDOT</th><th>Company</th><th>Add date</th><th>Contact</th><th>Location</th><th>Units</th><th>Insurance</th><th>New Entrant</th></tr></thead><tbody id="rows"></tbody></table></div>\n      <div class="meta"><span id="window">Date window: –</span><span id="generated">Generated: –</span></div>\n    </section>\n\n    <div class="section-title" id="integrations"><div><h2>n8n & API integrations</h2><p>Production-ready endpoints for automations, complete responses, exports, and monitoring.</p></div></div>\n    <div class="flow"><b>Recommended n8n flow:</b> HTTP Request → Split Out <code>carriers</code> → Google Sheets / CRM. Use <code>/n8n/output</code> because it returns a compact automation-friendly response without the larger audit arrays.</div>\n    <div class="endpoint-grid">\n      <article class="endpoint-card"><div class="endpoint-top"><h3>n8n qualified output</h3><span class="method">GET / POST</span></div><p>Use this in n8n. It runs every qualification check and returns the final carriers in a <code>carriers</code> array.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/n8n/output">/n8n/output</div><div class="payload-label">POST payload</div><div class="codebox">{\n  "days": 3\n}</div><button class="copy" onclick="copyEndpoint(\'/n8n/output\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Complete platform response</h3><span class="method get">GET</span></div><p>Use for dashboards or debugging. Includes final carriers, exclusion counts, source details, and audit summaries.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/api/data?days=3">/api/data?days=3</div><div class="payload-label">Query payload</div><div class="codebox">days=3  // allowed: 1–30</div><button class="copy" onclick="copyEndpoint(\'/api/data?days=3\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Webhook-compatible output</h3><span class="method">GET / POST</span></div><p>Use for existing webhook clients. Returns the complete platform result and accepts the same number-of-days payload.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/webhook">/webhook</div><div class="payload-label">POST payload</div><div class="codebox">{\n  "days": 3\n}</div><button class="copy" onclick="copyEndpoint(\'/webhook\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Service health check</h3><span class="method get">GET</span></div><p>Use in Render uptime monitors or n8n before a long run. It confirms that the Flask service is online.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/health">/health</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint(\'/health\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>CSV export</h3><span class="method get">GET</span></div><p>Downloads the latest final qualified carrier list. Use for spreadsheet imports and archival exports.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/download/csv">/download/csv</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint(\'/download/csv\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Excel workbook</h3><span class="method get">GET</span></div><p>Downloads qualified carriers plus separate audit sheets for insurance and OOS exclusions.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/download/excel">/download/excel</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint(\'/download/excel\')">Copy endpoint</button></article>\n    </div>\n    <div class="section-title"><div><h2>Official FMCSA sources</h2><p>Every final record is produced from these public federal datasets.</p></div></div>\n    <div class="source-list"><div class="source"><b>Company Census</b><span>az4n-8mr2 • New DOT candidates</span></div><div class="source"><b>Motus Insur</b><span>c5y8-a4uz • Current/pending filings</span></div><div class="source"><b>Motus InsHist</b><span>3uet-3z4i • Previous policies</span></div><div class="source"><b>New Entrant OOS</b><span>p2mt-9ige • OOS exclusion</span></div></div>\n  </main>\n</div>\n<script>\nlet records=[];\nconst esc=v=>String(v??\'\').replace(/[&<>"\']/g,m=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#039;\'}[m]));\nfunction render(){\n const q=document.getElementById(\'search\').value.toLowerCase().trim(), state=document.getElementById(\'state\').value;\n const list=records.filter(c=>(!state||c.phy_state===state)&&(!q||[c.usdot_number,c.legal_name,c.dba_name,c.phy_city,c.phy_state].join(\' \').toLowerCase().includes(q)));\n const body=document.getElementById(\'rows\');\n if(!list.length){body.innerHTML=\'<tr><td colspan="8" class="empty">No qualified carriers match this view.</td></tr>\';return}\n body.innerHTML=list.map(c=>`<tr><td><span class="name">${esc(c.usdot_number)}</span><span class="sub">${esc(c.docket_number||\'No docket\')}</span></td><td><span class="name">${esc(c.legal_name)}</span><span class="sub">${esc(c.dba_name||\'\')}</span></td><td><span class="tag blue">${esc(c.add_date)}</span></td><td>${esc(c.phone)}<span class="sub">${esc(c.email_address)}</span></td><td>${esc(c.phy_city)}, ${esc(c.phy_state)}<span class="sub">${esc(c.phy_zip)}</span></td><td>${esc(c.power_units)}</td><td><span class="tag green">No filing found</span><span class="sub">Codes: ${esc(c.insurance_form_codes_found)}</span></td><td><span class="tag gray">Candidate</span><span class="sub">No OOS found</span></td></tr>`).join(\'\');\n}\nasync function loadData(){\n const loader=document.getElementById(\'loader\'), err=document.getElementById(\'error\');loader.classList.add(\'show\');err.style.display=\'none\';\n try{\n  const r=await fetch(\'/api/data?days=\'+document.getElementById(\'days\').value),x=await r.json();if(!r.ok||!x.success)throw new Error(x.error||\'FMCSA request failed\');\n  records=x.carriers||[];const c=x.counts;\n  document.getElementById(\'initial\').textContent=c.strict_new_dot_candidates;document.getElementById(\'insurance\').textContent=c.excluded_for_current_pending_or_previous_insurance;document.getElementById(\'oos\').textContent=c.excluded_for_new_entrant_oos;document.getElementById(\'final\').textContent=c.final_verified_candidates;\n  document.getElementById(\'window\').textContent=`Window: ${x.date_window.start_inclusive} to before ${x.date_window.end_exclusive} • ${x.date_window.timezone}`;document.getElementById(\'generated\').textContent=\'Checked: \'+new Date(x.generated_at).toLocaleString();\n  const states=[...new Set(records.map(x=>x.phy_state).filter(Boolean))].sort();document.getElementById(\'state\').innerHTML=\'<option value="">All states</option>\'+states.map(s=>`<option>${esc(s)}</option>`).join(\'\');render();\n }catch(e){err.textContent=e.message;err.style.display=\'block\'}finally{loader.classList.remove(\'show\')}\n}\n\nfunction initializeEndpoints(){document.querySelectorAll(\'.dynamic-url\').forEach(el=>el.textContent=location.origin+el.dataset.path)}\nasync function copyEndpoint(path){try{await navigator.clipboard.writeText(location.origin+path);event.target.textContent=\'Copied\';setTimeout(()=>event.target.textContent=\'Copy endpoint\',1200)}catch(e){prompt(\'Copy endpoint:\',location.origin+path)}}\nwindow.onload=()=>{initializeEndpoints();loadData()};\n</script>\n</body></html>'
 
 
 @app.get("/")
@@ -472,6 +415,45 @@ def webhook():
     except Exception as error:
         app.logger.exception("FMCSA pipeline failed")
         return jsonify({"success": False, "error": str(error)}), 502
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": APP_NAME, "version": APP_VERSION})
+
+
+@app.route("/n8n/output", methods=["GET", "POST"])
+def n8n_output():
+    """Compact n8n-compatible output.
+
+    GET:  /n8n/output?days=3
+    POST: /n8n/output with {"days": 3}
+
+    The `carriers` property works directly with n8n's Split Out node.
+    """
+    payload = request.get_json(silent=True) or {} if request.method == "POST" else request.args
+    days = parse_days(payload.get("days", DEFAULT_DAYS))
+    try:
+        result = get_or_generate(days)
+        return jsonify({
+            "success": True,
+            "timestamp": result["generated_at"],
+            "days": result["days"],
+            "date_window": result["date_window"],
+            "total_records": len(result["carriers"]),
+            "counts": result["counts"],
+            "filters_applied": {
+                "census_status": "Active",
+                "classdef": "AUTHORIZED FOR HIRE (exact)",
+                "power_units": "> 0",
+                "insurance": "No current, pending, or previous FMCSA record of any form",
+                "new_entrant_oos": "No OOS order found",
+            },
+            "carriers": result["carriers"],
+        })
+    except Exception as error:
+        app.logger.exception("n8n output pipeline failed")
+        return jsonify({"success": False, "error": str(error), "carriers": []}), 502
 
 
 def latest_or_generate():
