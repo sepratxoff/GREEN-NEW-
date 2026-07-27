@@ -1,761 +1,510 @@
-import os
-from flask import Flask, render_template_string, request, jsonify, send_file
-import requests
-import json
-import pandas as pd
-from datetime import datetime, timedelta
 import io
+import os
+import threading
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+from flask import Flask, jsonify, render_template_string, request, send_file
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
-CARRIER_INFO_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
-STATUS_CHANGE_URL = "https://data.transportation.gov/resource/dm5j-zc6c.json"
+# Official FMCSA / DOT sources used by the n8n workflow.
+CENSUS_URL = "https://data.transportation.gov/resource/az4n-8mr2.json"
+CURRENT_INSURANCE_URL = "https://data.transportation.gov/resource/c5y8-a4uz.json"
+PREVIOUS_INSURANCE_URL = "https://data.transportation.gov/resource/3uet-3z4i.json"
+NEW_ENTRANT_OOS_URL = "https://data.transportation.gov/resource/p2mt-9ige.json"
+
+EASTERN = ZoneInfo("America/New_York")
+DEFAULT_DAYS = 3
+MAX_DAYS = 30
+PAGE_SIZE = 1000
+LOOKUP_BATCH_SIZE = 75
+REQUEST_TIMEOUT = 120
+
+CACHE_LOCK = threading.Lock()
+LATEST_RESULT = None
+
+
+def build_session():
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers.update({"User-Agent": "GreenVentures-FMCSA/2.0"})
+
+    # A Socrata app token is optional but recommended for higher rate limits.
+    token = os.environ.get("SOCRATA_APP_TOKEN", "").strip()
+    if token:
+        session.headers.update({"X-App-Token": token})
+    return session
+
+
+HTTP = build_session()
+
+
+def clean(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def clean_usdot(value):
+    value = clean(value)
+    return value[:-2] if value.endswith(".0") else value
+
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
 
 def get_date_window(days):
-    """
-    Calculate start and end dates for the window based on add_date.
-    - Last 1 Day: ONLY the previous calendar day (yesterday)
-    - Last N Days (N>1): from (today - N days) to today inclusive
-    
-    Returns (start_date_str, end_date_str) in YYYYMMDD format.
-    """
-    today = datetime.now()
-    end_date = today.strftime('%Y%m%d')
-    
-    if days == 1:
-        # Strictly yesterday only (as per user example: 25th → 24th)
-        start_date = (today - timedelta(days=1)).strftime('%Y%m%d')
-    else:
-        # For 3,7,14,30 days: go back N days (inclusive)
-        start_date = (today - timedelta(days=days)).strftime('%Y%m%d')
-    
-    return start_date, end_date
+    """Return the previous N Eastern calendar dates, excluding today."""
+    days = max(1, min(int(days), MAX_DAYS))
+    today = datetime.now(EASTERN).date()
+    start = today - timedelta(days=days)
+    return start.strftime("%Y%m%d"), today.strftime("%Y%m%d")
 
-def fetch_true_new_ventures(days=3):
-    """
-    Fetch carriers strictly based on add_date within the requested time window.
-    This is the CORRECT approach: filter on add_date from carrier master data.
-    
-    Rules:
-      - Last 1 Day: Only yesterday's add_date (previous calendar day)
-      - Last N Days: add_date >= (today - N days)
-    
-    Results are sorted DESCENDING by add_date (latest first) for best "recent first" experience.
-    """
-    start_date, end_date = get_date_window(days)
-    
-    print(f"[*] Fetching new ventures: add_date >= {start_date} (window: {start_date} → {end_date}) | days={days}")
 
-    all_carriers = []
-    limit = 1000
+def socrata_get(url, params):
+    response = HTTP.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Unexpected response from {url}: expected a JSON array")
+    return payload
+
+
+def fetch_all_pages(url, params):
+    rows = []
     offset = 0
-
-    # Direct query on CARRIER master table using add_date (no status needed for filtering)
-    where_clause = f"add_date >= '{start_date}'"
-    
     while True:
-        params = {
-            "$where": where_clause,
-            "$limit": limit,
-            "$offset": offset,
-            "$order": "add_date DESC, dot_number DESC"
-        }
-        try:
-            resp = requests.get(CARRIER_INFO_URL, params=params)
-            resp.raise_for_status()
-            batch = resp.json()
-            all_carriers.extend(batch)
-            print(f"    Batch: {len(batch)} records (offset {offset})")
-            if len(batch) < limit:
-                break
-            offset += limit
-        except Exception as e:
-            print(f"[!] Error fetching carrier batch: {e}")
-            break
+        page_params = dict(params)
+        page_params["$limit"] = PAGE_SIZE
+        page_params["$offset"] = offset
+        batch = socrata_get(url, page_params)
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return rows
+        offset += PAGE_SIZE
 
-    print(f"[+] Retrieved {len(all_carriers)} carriers with add_date >= {start_date}")
 
-    if not all_carriers:
-        return []
+def fetch_strict_new_dot_candidates(days):
+    start_date, today_date = get_date_window(days)
 
-    # Enrich with recent status changes (optional, for better "new entrant" info)
-    dots = [c.get("dot_number") for c in all_carriers if c.get("dot_number")]
-    status_map = {}
+    # These server-side conditions match the strict n8n New DOT filter.
+    where = (
+        f"add_date >= '{start_date}' AND add_date < '{today_date}' "
+        "AND status_code = 'A' "
+        "AND classdef = 'AUTHORIZED FOR HIRE' "
+        "AND power_units IS NOT NULL AND power_units != '0'"
+    )
 
-    if dots:
-        print(f"[*] Fetching status changes for {len(dots)} carriers...")
-        batch_size = 100
-        for i in range(0, len(dots), batch_size):
-            batch_dots = dots[i:i + batch_size]
-            dots_str = ",".join([f"'{d}'" for d in batch_dots])
-            try:
-                sc_params = {
-                    "$where": f"usdot_number in ({dots_str}) AND status_change_date >= '{start_date}'",
-                    "$limit": 2000
-                }
-                resp = requests.get(STATUS_CHANGE_URL, params=sc_params)
-                if resp.status_code == 200:
-                    for sc in resp.json():
-                        dot = sc.get("usdot_number")
-                        if dot and dot not in status_map:
-                            status_map[dot] = sc
-            except Exception as e:
-                print(f"[!] Status batch error (non-fatal): {e}")
+    params = {
+        "$select": (
+            "add_date,status_code,dot_number,phone,cell_phone,power_units,"
+            "truck_units,classdef,legal_name,dba_name,phy_street,phy_city,"
+            "phy_state,phy_zip,phy_country,email_address"
+        ),
+        "$where": where,
+        "$order": "add_date DESC,dot_number ASC",
+    }
+    rows = fetch_all_pages(CENSUS_URL, params)
 
-    # Build final dataset — strictly filtered by add_date
-    combined = []
-    for cd in all_carriers:
-        add_date = cd.get("add_date", "")
-        
-        # Strict add_date window filter
-        if not add_date or add_date < start_date:
+    candidates = []
+    seen = set()
+    for row in rows:
+        usdot = clean_usdot(row.get("dot_number"))
+        add_date = clean(row.get("add_date"))
+        power_units = safe_int(row.get("power_units"), 0)
+
+        # Local validation protects against unexpected source changes.
+        if not usdot or usdot in seen:
+            continue
+        if not (start_date <= add_date < today_date):
+            continue
+        if clean(row.get("status_code")).upper() != "A":
+            continue
+        if clean(row.get("classdef")).upper() != "AUTHORIZED FOR HIRE":
+            continue
+        if power_units <= 0:
             continue
 
-        dot = cd.get("dot_number")
-        sc = status_map.get(dot, {})
+        seen.add(usdot)
+        candidates.append(
+            {
+                "usdot_number": usdot,
+                "docket_number": "",
+                "legal_name": clean(row.get("legal_name")),
+                "dba_name": clean(row.get("dba_name")),
+                "add_date": add_date,
+                "status_change_date": "",
+                "op_auth_status": "Active",
+                "reason": "New DOT / Initial Authority",
+                "op_auth_type": "Motor Carrier of Property",
+                "phone": clean(row.get("phone")) or clean(row.get("cell_phone")),
+                "email_address": clean(row.get("email_address")),
+                "phy_street": clean(row.get("phy_street")),
+                "phy_city": clean(row.get("phy_city")),
+                "phy_state": clean(row.get("phy_state")),
+                "phy_zip": clean(row.get("phy_zip")),
+                "phy_country": clean(row.get("phy_country")),
+                "power_units": power_units,
+                "classdef": "AUTHORIZED FOR HIRE",
+                "source_dataset": "COMPANY_CENSUS",
+            }
+        )
 
-        merged = {
-            "usdot_number": dot or "",
-            "docket_number": sc.get("docket_number") or cd.get("docket1") or "",
-            "legal_name": cd.get("legal_name") or "",
-            "dba_name": cd.get("dba_name") or "",
-            "add_date": add_date,
-            "status_change_date": sc.get("status_change_date", ""),
-            "op_auth_status": sc.get("op_auth_status") or ("Active" if cd.get("status_code") == "A" else "Pending"),
-            "reason": sc.get("reason") or "New DOT / Initial Authority",
-            "op_auth_type": sc.get("op_auth_type") or "Motor Carrier of Property",
-            "phone": cd.get("phone") or cd.get("cell_phone") or "N/A",
-            "email_address": cd.get("email_address") or "N/A",
-            "phy_street": cd.get("phy_street") or "",
-            "phy_city": cd.get("phy_city") or "",
-            "phy_state": cd.get("phy_state") or "",
-            "phy_zip": cd.get("phy_zip") or "",
-            "power_units": int(cd.get("power_units") or cd.get("truck_units") or 1),
-            "classdef": cd.get("classdef") or "",
-        }
-        combined.append(merged)
-
-    # Sort DESCENDING by add_date (latest first) - this is the best ordering for "pulls in the latest"
-    # Secondary sort by status_change_date if present
-    combined.sort(key=lambda x: (x["add_date"], x.get("status_change_date") or ""), reverse=True)
-
-    print(f"[+] Final result: {len(combined)} carriers added between {start_date} and {end_date}")
-    return combined
+    candidates.sort(key=lambda x: (x["add_date"], x["usdot_number"]), reverse=True)
+    return candidates, start_date, today_date
 
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+def chunks(values, size):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def usdot_where(field_name, usdots):
+    safe_ids = [value for value in usdots if value.isdigit()]
+    quoted = ",".join(f"'{value}'" for value in safe_ids)
+    return f"{field_name} in ({quoted})"
+
+
+def fetch_insurance_matches(candidates):
+    """Return current/pending and previous insurance rows grouped by USDOT."""
+    current = {}
+    previous = {}
+    usdots = [item["usdot_number"] for item in candidates]
+
+    for batch in chunks(usdots, LOOKUP_BATCH_SIZE):
+        where = usdot_where("usdot_number", batch)
+
+        current_rows = socrata_get(
+            CURRENT_INSURANCE_URL,
+            {
+                "$select": (
+                    "usdot_number,ins_form_code,ins_type_code,ins_class_code,"
+                    "effective_date,trans_date,policy_no,insurance_company_name"
+                ),
+                "$where": where,
+                "$limit": 5000,
+            },
+        )
+        for row in current_rows:
+            current.setdefault(clean_usdot(row.get("usdot_number")), []).append(row)
+
+        previous_rows = socrata_get(
+            PREVIOUS_INSURANCE_URL,
+            {
+                "$select": (
+                    "usdot_number,ins_form_code,filing_status_reason,effective_date,"
+                    "cancl_effective_date,policy_no,insurance_company_name"
+                ),
+                "$where": where,
+                "$limit": 5000,
+            },
+        )
+        for row in previous_rows:
+            previous.setdefault(clean_usdot(row.get("usdot_number")), []).append(row)
+
+    return current, previous
+
+
+def remove_all_known_insurance(candidates, current, previous, checked_at):
+    """Strict rule: any FMCSA insurance form, current/pending or previous, excludes."""
+    passing = []
+    excluded = []
+
+    for carrier in candidates:
+        usdot = carrier["usdot_number"]
+        current_rows = current.get(usdot, [])
+        previous_rows = previous.get(usdot, [])
+        all_rows = current_rows + previous_rows
+        form_codes = sorted(
+            {
+                clean(row.get("ins_form_code"))
+                for row in all_rows
+                if clean(row.get("ins_form_code"))
+            }
+        )
+
+        if all_rows:
+            excluded.append(
+                {
+                    "usdot_number": usdot,
+                    "current_or_pending_rows": len(current_rows),
+                    "previous_rows": len(previous_rows),
+                    "form_codes": form_codes,
+                }
+            )
+            continue
+
+        passing.append(
+            {
+                **carrier,
+                "insurance_current_found": False,
+                "insurance_history_found": False,
+                "insurance_form_codes_found": "NONE",
+                "bipd_filing_found": False,
+                "cargo_filing_found": False,
+                "bond_or_trust_filing_found": False,
+                "insurance_checked_at": checked_at,
+                "insurance_verification_status": "NO_FMCSA_INSURANCE_HISTORY_FOUND",
+            }
+        )
+
+    return passing, excluded
+
+
+def fetch_new_entrant_oos(candidates):
+    matches = {}
+    usdots = [item["usdot_number"] for item in candidates]
+    for batch in chunks(usdots, LOOKUP_BATCH_SIZE):
+        rows = socrata_get(
+            NEW_ENTRANT_OOS_URL,
+            {
+                "$select": "dot_number,oos_date,oos_reason,status,rescind_date",
+                "$where": usdot_where("dot_number", batch),
+                "$limit": 5000,
+            },
+        )
+        for row in rows:
+            matches.setdefault(clean_usdot(row.get("dot_number")), []).append(row)
+    return matches
+
+
+def remove_new_entrant_oos(candidates, oos_matches, checked_at):
+    passing = []
+    excluded = []
+    for carrier in candidates:
+        usdot = carrier["usdot_number"]
+        rows = oos_matches.get(usdot, [])
+        if rows:
+            excluded.append(
+                {
+                    "usdot_number": usdot,
+                    "oos_orders": rows,
+                }
+            )
+            continue
+
+        passing.append(
+            {
+                **carrier,
+                # This is derived from recent add_date; it is not a direct FMCSA
+                # bulk field asserting official New Entrant program status.
+                "new_entrant_status": "NEW_ENTRANT_CANDIDATE_DERIVED_FROM_RECENT_ADD_DATE",
+                "new_entrant_oos_found": False,
+                "new_entrant_oos_checked_at": checked_at,
+            }
+        )
+    return passing, excluded
+
+
+def fetch_verified_new_ventures(days=DEFAULT_DAYS):
+    days = max(1, min(int(days), MAX_DAYS))
+    checked_at = datetime.now(EASTERN).isoformat()
+
+    candidates, start_date, today_date = fetch_strict_new_dot_candidates(days)
+    current, previous = fetch_insurance_matches(candidates)
+    uninsured, insurance_excluded = remove_all_known_insurance(
+        candidates, current, previous, checked_at
+    )
+    oos_matches = fetch_new_entrant_oos(uninsured)
+    final, oos_excluded = remove_new_entrant_oos(uninsured, oos_matches, checked_at)
+
+    final.sort(key=lambda x: (x["add_date"], x["usdot_number"]), reverse=True)
+
+    return {
+        "success": True,
+        "generated_at": checked_at,
+        "days": days,
+        "date_window": {
+            "start_inclusive": start_date,
+            "end_exclusive": today_date,
+            "timezone": "America/New_York",
+        },
+        "counts": {
+            "strict_new_dot_candidates": len(candidates),
+            "excluded_for_current_pending_or_previous_insurance": len(insurance_excluded),
+            "after_insurance_filter": len(uninsured),
+            "excluded_for_new_entrant_oos": len(oos_excluded),
+            "final_verified_candidates": len(final),
+        },
+        "definition": (
+            "Recent strict New DOT carrier with exact AUTHORIZED FOR HIRE, "
+            "positive power units, no current/pending/previous FMCSA insurance "
+            "record of any form code, and no New Entrant OOS order found."
+        ),
+        "sources": {
+            "census": "az4n-8mr2",
+            "current_pending_insurance": "c5y8-a4uz",
+            "previous_insurance": "3uet-3z4i",
+            "new_entrant_oos": "p2mt-9ige",
+        },
+        "carriers": final,
+        # Audit summaries contain USDOT identifiers and reasons but are not sent
+        # as final leads.
+        "audit": {
+            "insurance_excluded": insurance_excluded,
+            "new_entrant_oos_excluded": oos_excluded,
+        },
+    }
+
+
+def parse_days(value):
+    try:
+        return max(1, min(int(value), MAX_DAYS))
+    except (TypeError, ValueError):
+        return DEFAULT_DAYS
+
+
+def save_latest(result):
+    global LATEST_RESULT
+    with CACHE_LOCK:
+        LATEST_RESULT = result
+
+
+def get_or_generate(days):
+    result = fetch_verified_new_ventures(days)
+    save_latest(result)
+    return result
+
+
+HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FMCSA True New Ventures Intelligence Platform</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&amp;display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        :root {
-            --bs-body-font-family: 'Inter', sans-serif;
-            --sidebar-width: 260px;
-            --primary-color: #4f46e5;
-            --bg-color: #f8fafc;
-        }
-        body { background-color: var(--bg-color); color: #1e293b; overflow-x: hidden; }
-        .sidebar {
-            width: var(--sidebar-width);
-            height: 100vh;
-            position: fixed;
-            top: 0; left: 0;
-            background: #0f172a;
-            color: #94a3b8;
-            z-index: 1000;
-            box-shadow: 4px 0 10px rgba(0,0,0,0.05);
-        }
-        .sidebar-brand {
-            font-size: 1.25rem; font-weight: 700; color: #fff;
-            padding: 1.5rem 1.25rem; display: flex; align-items: center; gap: 10px;
-            border-bottom: 1px solid #1e293b;
-        }
-        .sidebar-menu { padding: 1.25rem 0.75rem; list-style: none; margin: 0; }
-        .sidebar-menu li { margin-bottom: 0.5rem; }
-        .sidebar-menu a {
-            display: flex; align-items: center; gap: 12px;
-            padding: 10px 14px; color: #94a3b8; text-decoration: none;
-            font-weight: 500; border-radius: 8px; transition: all 0.2s ease;
-        }
-        .sidebar-menu a:hover, .sidebar-menu a.active {
-            background: var(--primary-color); color: #fff;
-            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
-        }
-        .main-content { margin-left: var(--sidebar-width); padding: 2.5rem; min-height: 100vh; }
-        .card-stat {
-            background: #fff; border: none; border-radius: 14px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.03); position: relative; overflow: hidden;
-        }
-        .card-stat::after {
-            content: ''; position: absolute; top: 0; left: 0; width: 4px; height: 100%;
-            background: var(--primary-color);
-        }
-        .panel-box {
-            background: #fff; border: none; border-radius: 16px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.03); padding: 1.75rem; margin-bottom: 2rem;
-        }
-        .table-custom th {
-            font-weight: 600; color: #475569; background: #f8fafc !important;
-            border-bottom: 2px solid #e2e8f0; padding: 12px 16px; white-space: nowrap;
-        }
-        .table-custom td { padding: 14px 16px; vertical-align: middle; color: #334155; white-space: nowrap; }
-        .table-container { max-height: 650px; overflow-y: auto; border-radius: 12px; border: 1px solid #e2e8f0; }
-        #loadingOverlay {
-            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(255, 255, 255, 0.85); z-index: 9999;
-            justify-content: center; align-items: center; flex-direction: column; gap: 15px;
-        }
-        .badge-status { padding: 6px 12px; border-radius: 20px; font-weight: 500; font-size: 0.75rem; }
-        @media (max-width: 992px) {
-            .sidebar { width: 70px; }
-            .sidebar .sidebar-brand span, .sidebar .sidebar-menu span, .sidebar .sidebar-footer { display: none; }
-            .main-content { margin-left: 70px; padding: 1.5rem; }
-        }
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FMCSA Verified New Ventures</title>
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;background:#f4f7fb;color:#172033}
+    header{background:#111827;color:white;padding:22px 30px}
+    main{padding:24px;max-width:1500px;margin:auto}
+    .controls,.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+    button,select{padding:10px 14px;border-radius:8px;border:1px solid #ccd4e0}
+    button{background:#4f46e5;color:white;border:0;cursor:pointer}
+    .card{background:white;padding:16px;border-radius:12px;min-width:210px;box-shadow:0 3px 14px #0000000b}
+    .card b{font-size:26px;display:block;margin-top:8px}
+    .note{background:#fff8dc;border-left:4px solid #d99c00;padding:12px;margin-bottom:18px}
+    .table-wrap{overflow:auto;background:white;border-radius:12px;box-shadow:0 3px 14px #0000000b}
+    table{border-collapse:collapse;width:100%;font-size:13px}
+    th,td{padding:10px;border-bottom:1px solid #e6ebf2;text-align:left;white-space:nowrap}
+    th{position:sticky;top:0;background:#eef2ff}
+    .ok{color:#087f5b;font-weight:bold}.loading{opacity:.55;pointer-events:none}
+  </style>
 </head>
 <body>
-    <div id="loadingOverlay">
-        <div class="spinner-border text-indigo" style="width: 3.5rem; height: 3.5rem; color: var(--primary-color);" role="status"></div>
-        <h5 class="fw-semibold text-dark mt-2">Querying FMCSA New Entrant Program Database...</h5>
-        <p class="text-muted small">Fetching newly issued USDOTs and Initial Status authorities...</p>
-    </div>
+<header><h2>FMCSA Verified New Ventures</h2></header>
+<main id="app">
+  <div class="note">“No insurance history” means no record was found in the checked FMCSA datasets at the verification time. It does not prove that no non-FMCSA or intrastate policy exists.</div>
+  <div class="controls">
+    <select id="days"><option value="1">Previous 1 day</option><option value="3" selected>Previous 3 days</option><option value="7">Previous 7 days</option><option value="14">Previous 14 days</option><option value="30">Previous 30 days</option></select>
+    <button onclick="loadData()">Refresh official FMCSA data</button>
+    <button onclick="location.href='/download/csv'">Download CSV</button>
+    <button onclick="location.href='/download/excel'">Download Excel</button>
+  </div>
+  <div class="cards">
+    <div class="card">Strict New DOT candidates<b id="initial">–</b></div>
+    <div class="card">Excluded for insurance<b id="insurance">–</b></div>
+    <div class="card">Excluded for New Entrant OOS<b id="oos">–</b></div>
+    <div class="card">Final qualified list<b id="final">–</b></div>
+  </div>
+  <p id="window"></p>
+  <div class="table-wrap"><table><thead><tr><th>USDOT</th><th>Company</th><th>Add date</th><th>Phone</th><th>Email</th><th>Location</th><th>Power units</th><th>Insurance</th><th>New Entrant/OOS</th></tr></thead><tbody id="rows"></tbody></table></div>
+</main>
+<script>
+async function loadData(){
+ const app=document.getElementById('app'); app.classList.add('loading');
+ try{
+  const d=document.getElementById('days').value;
+  const r=await fetch('/api/data?days='+d); const x=await r.json();
+  if(!r.ok||!x.success) throw new Error(x.error||'Request failed');
+  document.getElementById('initial').textContent=x.counts.strict_new_dot_candidates;
+  document.getElementById('insurance').textContent=x.counts.excluded_for_current_pending_or_previous_insurance;
+  document.getElementById('oos').textContent=x.counts.excluded_for_new_entrant_oos;
+  document.getElementById('final').textContent=x.counts.final_verified_candidates;
+  document.getElementById('window').textContent=`Date window: ${x.date_window.start_inclusive} through the day before ${x.date_window.end_exclusive} (${x.date_window.timezone})`;
+  document.getElementById('rows').innerHTML=x.carriers.map(c=>`<tr><td>${c.usdot_number}</td><td>${c.legal_name||''}</td><td>${c.add_date}</td><td>${c.phone||''}</td><td>${c.email_address||''}</td><td>${c.phy_city||''}, ${c.phy_state||''}</td><td>${c.power_units}</td><td class="ok">No FMCSA history found</td><td class="ok">Candidate; no OOS found</td></tr>`).join('');
+ }catch(e){alert(e.message)}finally{app.classList.remove('loading')}
+}
+window.onload=loadData;
+</script>
+</body></html>"""
 
-    <div class="sidebar d-flex flex-column justify-content-between">
-        <div>
-            <div class="sidebar-brand">
-                <i class="fa-solid fa-truck-fast text-indigo" style="color: #6366f1;"></i>
-                <span>NewVentures</span>
-            </div>
-            <ul class="sidebar-menu">
-                <li><a href="#" class="active" onclick="switchTab('dashboard', event)"><i class="fa-solid fa-chart-pie fa-fw"></i> <span>Dashboard</span></a></li>
-                <li><a href="#" onclick="switchTab('analytics', event)"><i class="fa-solid fa-chart-column fa-fw"></i> <span>Analytics</span></a></li>
-                <li><a href="#" onclick="switchTab('webhook', event)"><i class="fa-solid fa-bolt fa-fw"></i> <span>n8n Webhooks</span></a></li>
-                <li><a href="/download/csv" target="_blank"><i class="fa-solid fa-file-csv fa-fw"></i> <span>Export CSV</span></a></li>
-                <li><a href="/download/excel" target="_blank"><i class="fa-solid fa-file-excel fa-fw"></i> <span>Export Excel</span></a></li>
-            </ul>
-        </div>
-        <div class="p-3 m-3 rounded bg-dark border border-secondary text-center sidebar-footer">
-            <small class="text-success fw-bold"><i class="fa-solid fa-circle fa-2xs me-1"></i> New Entrant Verified</small>
-        </div>
-    </div>
 
-    <div class="main-content">
-        <div id="tab-dashboard" class="tab-pane">
-            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-4">
-                <div>
-                    <h2 class="fw-bold mb-1">True New Ventures (New Entrant Program)</h2>
-                    <p class="text-muted mb-0">Carriers getting their USDOT or Initial Authority status for the first time (filtered by add_date).</p>
-                </div>
-                <div class="d-flex align-items-center gap-2">
-                    <select id="daysSelect" class="form-select shadow-sm" style="width: 150px;">
-                        <option value="1">Last 1 Day</option>
-                        <option value="3" selected>Last 3 Days</option>
-                        <option value="7">Last 7 Days</option>
-                        <option value="14">Last 14 Days</option>
-                        <option value="30">Last 30 Days</option>
-                    </select>
-                    <button class="btn btn-primary shadow-sm px-4 d-flex align-items-center gap-2" onclick="loadData()" style="background-color: var(--primary-color); border: none;">
-                        <i class="fa-solid fa-rotate"></i> Refresh
-                    </button>
-                </div>
-            </div>
-
-            <div class="row g-4 mb-4">
-                <div class="col-md-3">
-                    <div class="card card-stat p-4">
-                        <span class="text-muted small fw-semibold text-uppercase">New Entrants</span>
-                        <h2 id="statTotal" class="fw-bold mt-2 mb-0 text-dark">0</h2>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card card-stat p-4" style="--primary-color: #10b981;">
-                        <span class="text-muted small fw-semibold text-uppercase">Active / Pending</span>
-                        <h2 id="statActive" class="fw-bold mt-2 mb-0 text-success">0</h2>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card card-stat p-4" style="--primary-color: #0ea5e9;">
-                        <span class="text-muted small fw-semibold text-uppercase">States Covered</span>
-                        <h2 id="statStates" class="fw-bold mt-2 mb-0 text-info">0</h2>
-                    </div>
-                </div>
-                <div class="col-md-3">
-                    <div class="card card-stat p-4" style="--primary-color: #f59e0b;">
-                        <span class="text-muted small fw-semibold text-uppercase">Total Power Units</span>
-                        <h2 id="statUnits" class="fw-bold mt-2 mb-0 text-warning">0</h2>
-                    </div>
-                </div>
-            </div>
-
-            <div class="panel-box">
-                <div class="row g-3 mb-4">
-                    <div class="col-md-6">
-                        <div class="input-group shadow-sm">
-                            <span class="input-group-text bg-white border-end-0"><i class="fa-solid fa-search text-muted"></i></span>
-                            <input type="text" id="searchInput" class="form-control border-start-0" placeholder="Search company name, USDOT, city, email..." onkeyup="filterTable()">
-                        </div>
-                    </div>
-                    <div class="col-md-3">
-                        <select id="stateFilter" class="form-select shadow-sm" onchange="filterTable()">
-                            <option value="">All States</option>
-                        </select>
-                    </div>
-                    <div class="col-md-3">
-                        <select id="statusFilter" class="form-select shadow-sm" onchange="filterTable()">
-                            <option value="">All Statuses</option>
-                            <option value="Pending">Pending</option>
-                            <option value="Active">Active</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="table-container">
-                    <table class="table table-hover align-middle table-custom mb-0" id="venturesTable">
-                        <thead class="sticky-top">
-                            <tr>
-                                <th>USDOT / Docket</th>
-                                <th>Company Name</th>
-                                <th>Add Date</th>
-                                <th>Status / Reason</th>
-                                <th>Contact Information</th>
-                                <th>Location</th>
-                                <th>Power Units</th>
-                            </tr>
-                        </thead>
-                        <tbody id="tableBody"></tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <div id="tab-analytics" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">New Ventures Analytics &amp; Insights</h2>
-            <div class="row g-4">
-                <div class="col-lg-6">
-                    <div class="panel-box">
-                        <h5 class="fw-bold mb-3">Top 10 States for New Registrations</h5>
-                        <canvas id="stateChart" height="250"></canvas>
-                    </div>
-                </div>
-                <div class="col-lg-6">
-                    <div class="panel-box">
-                        <h5 class="fw-bold mb-3">Registration Volume by Date</h5>
-                        <canvas id="dateChart" height="250"></canvas>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div id="tab-webhook" class="tab-pane" style="display: none;">
-            <h2 class="fw-bold mb-4">n8n Automation &amp; Webhook Integration</h2>
-            <div class="panel-box">
-                <h4 class="fw-bold text-indigo mb-3" style="color: var(--primary-color);"><i class="fa-solid fa-link me-2"></i> Platform Endpoints</h4>
-                <p class="text-muted mb-4">Connect these endpoints into n8n or automated scripts to fetch verified new ventures and export data automatically.</p>
-                
-                <div class="mb-4">
-                    <label class="form-label fw-bold">Webhook URL (POST / GET)</label>
-                    <div class="input-group shadow-sm">
-                        <input type="text" class="form-control font-monospace bg-light" id="webhookUrl" value="" readonly>
-                        <button class="btn btn-outline-primary" onclick="copyText('webhookUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
-                    </div>
-                    <small class="text-muted mt-1 d-block">JSON Payload: <code>{ "days": 3 }</code></small>
-                </div>
-                <div class="mb-4">
-                    <label class="form-label fw-bold">Direct CSV Download URL</label>
-                    <div class="input-group shadow-sm">
-                        <input type="text" class="form-control font-monospace bg-light" id="csvUrl" value="" readonly>
-                        <button class="btn btn-outline-primary" onclick="copyText('csvUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
-                    </div>
-                </div>
-                <div class="mb-3">
-                    <label class="form-label fw-bold">Direct Excel Download URL</label>
-                    <div class="input-group shadow-sm">
-                        <input type="text" class="form-control font-monospace bg-light" id="excelUrl" value="" readonly>
-                        <button class="btn btn-outline-primary" onclick="copyText('excelUrl')"><i class="fa-solid fa-copy"></i> Copy</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        let allData = [];
-        let stateChartInstance = null;
-        let dateChartInstance = null;
-
-        function setWebhookUrls() {
-            const origin = window.location.origin;
-            document.getElementById('webhookUrl').value = origin + '/webhook';
-            document.getElementById('csvUrl').value = origin + '/download/csv';
-            document.getElementById('excelUrl').value = origin + '/download/excel';
-        }
-
-        function switchTab(tabName, event) {
-            if (event) event.preventDefault();
-            document.querySelectorAll('.sidebar-menu a').forEach(el => el.classList.remove('active'));
-            if (event && event.currentTarget) event.currentTarget.classList.add('active');
-            
-            document.getElementById('tab-dashboard').style.display = tabName === 'dashboard' ? 'block' : 'none';
-            document.getElementById('tab-analytics').style.display = tabName === 'analytics' ? 'block' : 'none';
-            document.getElementById('tab-webhook').style.display = tabName === 'webhook' ? 'block' : 'none';
-            
-            if (tabName === 'analytics') {
-                renderCharts();
-            }
-        }
-
-        async function loadData() {
-            const days = document.getElementById('daysSelect').value;
-            const overlay = document.getElementById('loadingOverlay');
-            overlay.style.display = 'flex';
-            
-            try {
-                const response = await fetch(`/api/data?days=${days}`);
-                const result = await response.json();
-                
-                if (result.success) {
-                    allData = result.data || [];
-                    populateStateDropdown(allData);
-                    renderTable(allData);
-                    updateStats(allData);
-                } else {
-                    alert('Failed to load data from server');
-                }
-            } catch (err) {
-                console.error(err);
-                alert('Error connecting to server. Check console for details.');
-            } finally {
-                overlay.style.display = 'none';
-            }
-        }
-
-        function populateStateDropdown(data) {
-            const states = [...new Set(data.map(i => i.phy_state).filter(Boolean))].sort();
-            const select = document.getElementById('stateFilter');
-            select.innerHTML = '<option value="">All States</option>';
-            states.forEach(state => {
-                const opt = document.createElement('option');
-                opt.value = state;
-                opt.textContent = state;
-                select.appendChild(opt);
-            });
-        }
-
-        function renderTable(data) {
-            const tbody = document.getElementById('tableBody');
-            tbody.innerHTML = '';
-            
-            if (!data || data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-5">No new entrant ventures found for this period (based on add_date).</td></tr>';
-                return;
-            }
-            
-            data.forEach(item => {
-                const isPending = item.op_auth_status === 'Pending' || item.reason.includes('Initial');
-                const badgeClass = isPending ? 'bg-primary bg-opacity-10 text-primary' : 'bg-success bg-opacity-10 text-success';
-                
-                const row = `
-                    <tr>
-                        <td>
-                            <div class="fw-bold">${item.usdot_number}</div>
-                            <small class="text-muted">Docket: ${item.docket_number || 'N/A'}</small>
-                        </td>
-                        <td>
-                            <div class="fw-bold text-dark">${item.legal_name || 'N/A'}</div>
-                            ${item.dba_name ? `<small class="text-muted">DBA: ${item.dba_name}</small>` : ''}
-                        </td>
-                        <td><span class="badge bg-light text-dark border">${item.add_date}</span></td>
-                        <td>
-                            <span class="badge badge-status ${badgeClass}">${item.op_auth_status}</span>
-                            <div class="small text-muted mt-1">${item.reason}</div>
-                        </td>
-                        <td>
-                            <div><i class="fa-solid fa-phone text-muted me-1 small"></i> ${item.phone}</div>
-                            <div><i class="fa-solid fa-envelope text-muted me-1 small"></i> <a href="mailto:${item.email_address}" class="text-decoration-none">${item.email_address}</a></div>
-                        </td>
-                        <td>${item.phy_city}, ${item.phy_state} ${item.phy_zip}</td>
-                        <td><span class="badge bg-dark bg-opacity-10 text-dark px-3 py-2">${item.power_units} Units</span></td>
-                    </tr>`;
-                tbody.innerHTML += row;
-            });
-        }
-
-        function updateStats(data) {
-            document.getElementById('statTotal').innerText = data.length;
-            
-            const activeCount = data.filter(i => 
-                i.op_auth_status === 'Active' || 
-                (i.op_auth_status !== 'Pending' && !i.reason.includes('Initial'))
-            ).length;
-            document.getElementById('statActive').innerText = activeCount || data.length;
-            
-            const states = new Set(data.map(i => i.phy_state).filter(Boolean)).size;
-            document.getElementById('statStates').innerText = states;
-            
-            const totalUnits = data.reduce((acc, curr) => acc + (parseInt(curr.power_units) || 0), 0);
-            document.getElementById('statUnits').innerText = totalUnits;
-        }
-
-        function filterTable() {
-            const query = document.getElementById('searchInput').value.toLowerCase().trim();
-            const selectedState = document.getElementById('stateFilter').value;
-            const selectedStatus = document.getElementById('statusFilter').value;
-            
-            const filtered = allData.filter(item => {
-                const matchesQuery = !query || 
-                    (item.legal_name && item.legal_name.toLowerCase().includes(query)) ||
-                    (item.usdot_number && item.usdot_number.toLowerCase().includes(query)) ||
-                    (item.phy_city && item.phy_city.toLowerCase().includes(query)) ||
-                    (item.phy_state && item.phy_state.toLowerCase().includes(query)) ||
-                    (item.email_address && item.email_address.toLowerCase().includes(query)) ||
-                    (item.dba_name && item.dba_name.toLowerCase().includes(query));
-                
-                const matchesState = !selectedState || item.phy_state === selectedState;
-                
-                let matchesStatus = true;
-                if (selectedStatus) {
-                    if (selectedStatus === 'Pending') {
-                        matchesStatus = item.op_auth_status === 'Pending' || item.reason.includes('Initial');
-                    } else {
-                        matchesStatus = item.op_auth_status === 'Active';
-                    }
-                }
-                
-                return matchesQuery && matchesState && matchesStatus;
-            });
-            
-            renderTable(filtered);
-        }
-
-        function renderCharts() {
-            if (!allData || allData.length === 0) return;
-
-            // State chart
-            const stateCounts = {};
-            allData.forEach(item => {
-                if (item.phy_state) {
-                    stateCounts[item.phy_state] = (stateCounts[item.phy_state] || 0) + 1;
-                }
-            });
-            const sortedStates = Object.entries(stateCounts).sort((a, b) => b[1] - a[1]).slice(0, 10);
-
-            if (stateChartInstance) stateChartInstance.destroy();
-            const ctx1 = document.getElementById('stateChart').getContext('2d');
-            stateChartInstance = new Chart(ctx1, {
-                type: 'bar',
-                data: {
-                    labels: sortedStates.map(i => i[0]),
-                    datasets: [{
-                        label: 'New Ventures',
-                        data: sortedStates.map(i => i[1]),
-                        backgroundColor: '#4f46e5',
-                        borderRadius: 6
-                    }]
-                },
-                options: { 
-                    responsive: true, 
-                    plugins: { legend: { display: false } },
-                    scales: { y: { beginAtZero: true } }
-                }
-            });
-
-            // Date chart - by add_date
-            const dateCounts = {};
-            allData.forEach(item => {
-                if (item.add_date) {
-                    dateCounts[item.add_date] = (dateCounts[item.add_date] || 0) + 1;
-                }
-            });
-            const sortedDates = Object.entries(dateCounts).sort((a, b) => a[0].localeCompare(b[0]));
-
-            if (dateChartInstance) dateChartInstance.destroy();
-            const ctx2 = document.getElementById('dateChart').getContext('2d');
-            dateChartInstance = new Chart(ctx2, {
-                type: 'line',
-                data: {
-                    labels: sortedDates.map(i => i[0]),
-                    datasets: [{
-                        label: 'Registrations',
-                        data: sortedDates.map(i => i[1]),
-                        borderColor: '#06b6d4',
-                        backgroundColor: 'rgba(6, 182, 212, 0.1)',
-                        fill: true,
-                        tension: 0.3,
-                        pointRadius: 4
-                    }]
-                },
-                options: { 
-                    responsive: true, 
-                    plugins: { legend: { display: false } },
-                    scales: { y: { beginAtZero: true } }
-                }
-            });
-        }
-
-        function copyText(elementId) {
-            const el = document.getElementById(elementId);
-            el.select();
-            navigator.clipboard.writeText(el.value).then(() => {
-                const originalText = el.nextElementSibling ? el.nextElementSibling.innerHTML : '';
-                const btn = el.parentElement.querySelector('button');
-                if (btn) {
-                    const orig = btn.innerHTML;
-                    btn.innerHTML = '<i class="fa-solid fa-check"></i> Copied!';
-                    setTimeout(() => { btn.innerHTML = orig; }, 1800);
-                }
-            }).catch(() => {
-                // fallback
-                document.execCommand('copy');
-                alert("Copied to clipboard!");
-            });
-        }
-
-        // Initialize
-        window.onload = () => {
-            setWebhookUrls();
-            loadData();
-            
-            // Keyboard support
-            document.getElementById('daysSelect').addEventListener('change', () => {
-                loadData();
-            });
-        };
-    </script>
-</body>
-</html>"""
-
-@app.route("/", methods=["GET"])
+@app.get("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/api/data", methods=["GET"])
+
+@app.get("/api/data")
 def api_data():
+    days = parse_days(request.args.get("days", DEFAULT_DAYS))
     try:
-        days = int(request.args.get("days", 3))
-    except (ValueError, TypeError):
-        days = 3
-    
-    data = fetch_true_new_ventures(days=days)
-    
-    # Always save latest for downloads
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    if data:
-        df = pd.DataFrame(data)
-        latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
-        df.to_csv(latest_path, index=False)
-    
-    return jsonify({
-        "success": True,
-        "count": len(data),
-        "days_queried": days,
-        "date_window": get_date_window(days),
-        "data": data
-    })
+        return jsonify(get_or_generate(days))
+    except Exception as error:
+        app.logger.exception("FMCSA pipeline failed")
+        return jsonify({"success": False, "error": str(error)}), 502
+
 
 @app.route("/run", methods=["GET", "POST"])
-def run_pipeline():
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    body = request.get_json(silent=True) or {} if request.method == "POST" else request.args
+    days = parse_days(body.get("days", DEFAULT_DAYS))
     try:
-        days = int(request.args.get("days", 3))
-    except (ValueError, TypeError):
-        days = 3
-    
-    data = fetch_true_new_ventures(days=days)
-    
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_filename = None
-    
-    if data:
-        df = pd.DataFrame(data)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        csv_filename = f"true_new_ventures_{timestamp}.csv"
-        csv_path = os.path.join(current_dir, csv_filename)
-        df.to_csv(csv_path, index=False)
-        
-        # Update latest
-        latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
-        df.to_csv(latest_path, index=False)
-    
-    return jsonify({
-        "success": True,
-        "count": len(data),
-        "days_queried": days,
-        "csv_file": csv_filename,
-        "download_url": "/download/csv",
-        "data": data
-    })
+        return jsonify(get_or_generate(days))
+    except Exception as error:
+        app.logger.exception("FMCSA pipeline failed")
+        return jsonify({"success": False, "error": str(error)}), 502
 
-@app.route("/webhook", methods=["POST", "GET"])
-def n8n_webhook():
-    if request.method == "POST":
-        req_data = request.get_json(silent=True) or {}
-    else:
-        req_data = request.args.to_dict()
-    
-    try:
-        days = int(req_data.get("days", 3))
-    except (ValueError, TypeError):
-        days = 3
-    
-    data = fetch_true_new_ventures(days=days)
-    
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    if data:
-        df = pd.DataFrame(data)
-        latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
-        df.to_csv(latest_path, index=False)
-    
-    start_date, end_date = get_date_window(days)
-    
-    return jsonify({
-        "success": True,
-        "timestamp": datetime.now().isoformat(),
-        "days": days,
-        "date_window": {"start": start_date, "end": end_date},
-        "total_records": len(data),
-        "carriers": data
-    })
 
-@app.route("/download/csv", methods=["GET"])
+def latest_or_generate():
+    with CACHE_LOCK:
+        cached = LATEST_RESULT
+    return cached if cached else get_or_generate(DEFAULT_DAYS)
+
+
+@app.get("/download/csv")
 def download_csv():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
-    
-    if os.path.exists(latest_path):
-        return send_file(
-            latest_path, 
-            mimetype="text/csv", 
-            as_attachment=True, 
-            download_name="true_new_ventures_by_add_date.csv"
-        )
-    return jsonify({"error": "No CSV file generated yet. Please load data first."}), 404
+    result = latest_or_generate()
+    frame = pd.DataFrame(result["carriers"])
+    data = io.BytesIO(frame.to_csv(index=False).encode("utf-8"))
+    return send_file(data, mimetype="text/csv", as_attachment=True, download_name="verified_new_ventures.csv")
 
-@app.route("/download/excel", methods=["GET"])
+
+@app.get("/download/excel")
 def download_excel():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    latest_path = os.path.join(current_dir, "new_ventures_latest.csv")
-    
-    if os.path.exists(latest_path):
-        df = pd.read_csv(latest_path)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='New Ventures')
-        output.seek(0)
-        
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f"true_new_ventures_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        )
-    return jsonify({"error": "No data generated yet. Please load data first."}), 404
+    result = latest_or_generate()
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(result["carriers"]).to_excel(writer, index=False, sheet_name="Qualified Ventures")
+        pd.DataFrame(result["audit"]["insurance_excluded"]).to_excel(writer, index=False, sheet_name="Insurance Excluded")
+        pd.DataFrame(result["audit"]["new_entrant_oos_excluded"]).to_excel(writer, index=False, sheet_name="OOS Excluded")
+    output.seek(0)
+    return send_file(
+        output,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="verified_new_ventures.xlsx",
+    )
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"Starting FMCSA New Ventures app on port {port}...")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
