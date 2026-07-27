@@ -50,12 +50,22 @@ Set these in Render under **Environment**:
 PLATFORM_USERNAME=your_login_name
 PLATFORM_PASSWORD=use_a_long_unique_password
 FLASK_SECRET_KEY=use_a_long_random_secret
-N8N_USERNAME=your_n8n_username
-N8N_PASSWORD=use_a_different_long_unique_password
 SESSION_COOKIE_SECURE=true
 ```
 
-Browser users sign in with `PLATFORM_USERNAME` and `PLATFORM_PASSWORD`. The `/n8n/output` endpoint requires HTTP Basic Auth using `N8N_USERNAME` and `N8N_PASSWORD`.
+The visual dashboard requires `PLATFORM_USERNAME` and `PLATFORM_PASSWORD`. All automation and export endpoints are public and require no password or API key:
+
+```text
+/n8n/output
+/api/data
+/webhook
+/run
+/health
+/download/csv
+/download/excel
+```
+
+Anyone who knows these URLs can use them.
 
 Optional:
 
