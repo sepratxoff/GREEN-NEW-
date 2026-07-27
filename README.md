@@ -50,10 +50,12 @@ Set these in Render under **Environment**:
 PLATFORM_USERNAME=your_login_name
 PLATFORM_PASSWORD=use_a_long_unique_password
 FLASK_SECRET_KEY=use_a_long_random_secret
+N8N_USERNAME=your_n8n_username
+N8N_PASSWORD=use_a_different_long_unique_password
 SESSION_COOKIE_SECURE=true
 ```
 
-Browser users must sign in. The `/n8n/output` endpoint is intentionally public and does not require an API key, so keep in mind that anyone who knows its URL can call it.
+Browser users sign in with `PLATFORM_USERNAME` and `PLATFORM_PASSWORD`. The `/n8n/output` endpoint requires HTTP Basic Auth using `N8N_USERNAME` and `N8N_PASSWORD`.
 
 Optional:
 
