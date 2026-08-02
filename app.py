@@ -16,6 +16,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 app = Flask(__name__)
+
 APP_NAME = "GreenVentures"
 APP_VERSION = "3.4.0-public-api-endpoints"
 
@@ -23,6 +24,7 @@ APP_VERSION = "3.4.0-public-api-endpoints"
 PLATFORM_USERNAME = os.environ.get("PLATFORM_USERNAME", "admin").strip()
 PLATFORM_PASSWORD = os.environ.get("PLATFORM_PASSWORD", "")
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
@@ -41,6 +43,7 @@ PREVIOUS_INSURANCE_URL = "https://data.transportation.gov/resource/3uet-3z4i.jso
 NEW_ENTRANT_OOS_URL = "https://data.transportation.gov/resource/p2mt-9ige.json"
 
 EASTERN = ZoneInfo("America/New_York")
+
 DEFAULT_DAYS = 3
 MAX_DAYS = 30
 PAGE_SIZE = 1000
@@ -53,7 +56,6 @@ LATEST_RESULT = None
 
 def secure_equal(left, right):
     return bool(left) and bool(right) and hmac.compare_digest(str(left), str(right))
-
 
 
 def login_is_rate_limited(ip):
@@ -81,6 +83,7 @@ def require_authentication():
         "download_csv",
         "download_excel",
     }
+
     if request.endpoint in public_endpoints:
         return None
 
@@ -91,6 +94,7 @@ def require_authentication():
     wants_html = request.path == "/" or "text/html" in request.headers.get("Accept", "")
     if wants_html:
         return redirect(url_for("login", next=request.full_path if request.query_string else request.path))
+
     return jsonify({
         "success": False,
         "error": "Browser login required",
@@ -116,6 +120,7 @@ def build_session():
     token = os.environ.get("SOCRATA_APP_TOKEN", "").strip()
     if token:
         session.headers.update({"X-App-Token": token})
+
     return session
 
 
@@ -138,6 +143,24 @@ def safe_int(value, default=0):
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def classify_fleet(row):
+    """Infer equipment type from FMCSA census fields (mirrors the workflow)."""
+    tractors = safe_int(row.get("owntract")) + safe_int(row.get("trmtract"))
+    trucks = safe_int(row.get("owntruck")) + safe_int(row.get("trmtruck"))
+    trailers = safe_int(row.get("owntrail")) + safe_int(row.get("trmtrail"))
+    if tractors > 0 and trailers > 0:
+        return "Tractor-Trailer"
+    if tractors > 0:
+        return "Tractor Only"
+    if trucks > 0 and trailers > 0:
+        return "Straight Truck + Trailer"
+    if trucks > 0:
+        return "Straight Truck"
+    if trailers > 0:
+        return "Trailer Operation"
+    return "Not Reported"
 
 
 def get_date_window(days):
@@ -186,15 +209,19 @@ def fetch_strict_new_dot_candidates(days):
         "$select": (
             "add_date,status_code,dot_number,phone,cell_phone,power_units,"
             "truck_units,classdef,legal_name,dba_name,phy_street,phy_city,"
-            "phy_state,phy_zip,phy_country,email_address"
+            "phy_state,phy_zip,phy_country,email_address,"
+            "owntruck,owntract,owntrail,trmtruck,trmtract,trmtrail,"
+            "crgo_cargoothr_desc,hm_ind,carrier_operation,total_drivers,total_cdl"
         ),
         "$where": where,
         "$order": "add_date DESC,dot_number ASC",
     }
+
     rows = fetch_all_pages(CENSUS_URL, params)
 
     candidates = []
     seen = set()
+
     for row in rows:
         usdot = clean_usdot(row.get("dot_number"))
         add_date = clean(row.get("add_date"))
@@ -213,6 +240,7 @@ def fetch_strict_new_dot_candidates(days):
             continue
 
         seen.add(usdot)
+
         candidates.append(
             {
                 "usdot_number": usdot,
@@ -233,6 +261,19 @@ def fetch_strict_new_dot_candidates(days):
                 "phy_country": clean(row.get("phy_country")),
                 "power_units": power_units,
                 "classdef": "AUTHORIZED FOR HIRE",
+                "truck_units": safe_int(row.get("truck_units")),
+                "cargo_description": clean(row.get("crgo_cargoothr_desc")),
+                "hazmat": clean(row.get("hm_ind")),
+                "carrier_operation": clean(row.get("carrier_operation")),
+                "owned_trucks": safe_int(row.get("owntruck")),
+                "owned_tractors": safe_int(row.get("owntract")),
+                "owned_trailers": safe_int(row.get("owntrail")),
+                "leased_trucks": safe_int(row.get("trmtruck")),
+                "leased_tractors": safe_int(row.get("trmtract")),
+                "leased_trailers": safe_int(row.get("trmtrail")),
+                "total_drivers": safe_int(row.get("total_drivers")),
+                "total_cdl_drivers": safe_int(row.get("total_cdl")),
+                "fleet_type": classify_fleet(row),
                 "source_dataset": "COMPANY_CENSUS",
             }
         )
@@ -341,6 +382,7 @@ def remove_all_known_insurance(candidates, current, previous, checked_at):
 def fetch_new_entrant_oos(candidates):
     matches = {}
     usdots = [item["usdot_number"] for item in candidates]
+
     for batch in chunks(usdots, LOOKUP_BATCH_SIZE):
         rows = socrata_get(
             NEW_ENTRANT_OOS_URL,
@@ -352,15 +394,18 @@ def fetch_new_entrant_oos(candidates):
         )
         for row in rows:
             matches.setdefault(clean_usdot(row.get("dot_number")), []).append(row)
+
     return matches
 
 
 def remove_new_entrant_oos(candidates, oos_matches, checked_at):
     passing = []
     excluded = []
+
     for carrier in candidates:
         usdot = carrier["usdot_number"]
         rows = oos_matches.get(usdot, [])
+
         if rows:
             excluded.append(
                 {
@@ -380,6 +425,7 @@ def remove_new_entrant_oos(candidates, oos_matches, checked_at):
                 "new_entrant_oos_checked_at": checked_at,
             }
         )
+
     return passing, excluded
 
 
@@ -453,14 +499,119 @@ def get_or_generate(days):
     return result
 
 
-HTML_TEMPLATE = '<!doctype html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width,initial-scale=1">\n  <title>GreenVentures • FMCSA New Venture Intelligence</title>\n  <style>\n    :root{--navy:#ffffff;--navy2:#f6fff9;--ink:#123326;--muted:#648075;--line:#dcebe3;--bg:#f4faf6;--white:#fff;--green:#16a34a;--blue:#16a34a;--cyan:#059669;--amber:#f59e0b;--red:#ef4444}\n    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}\n    .layout{display:grid;grid-template-columns:258px 1fr;min-height:100vh}.side{background:linear-gradient(180deg,var(--navy),var(--navy2));color:#47695b;border-right:1px solid var(--line);padding:24px 18px;position:sticky;top:0;height:100vh}\n    .brand{display:flex;align-items:center;gap:12px;color:#14532d;font-weight:800;font-size:20px;padding:4px 7px 26px}.logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,#16a34a,#34d399);color:white;box-shadow:0 8px 25px #16a34a35}\n    .nav-title{font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:#7b9589;margin:18px 10px 8px}.nav-item{display:flex;gap:11px;align-items:center;padding:11px 12px;border-radius:10px;margin:4px 0;color:#47695b;text-decoration:none}.nav-item:hover{background:#dcfce7;color:#166534}.nav-item.active{background:#dcfce7;color:#166534;font-weight:750}.side-foot{position:absolute;bottom:22px;left:18px;right:18px;border:1px solid #d7eadf;background:#ffffff;border-radius:12px;padding:13px;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px #10b98122;margin-right:8px}\n    main{padding:30px;min-width:0}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:24px}.top h1{font-size:27px;margin:0 0 7px}.top p{margin:0;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap}select,button,input{font:inherit}.btn,.select{border:1px solid var(--line);background:#fff;border-radius:10px;padding:10px 13px}.btn{cursor:pointer;font-weight:700}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue);box-shadow:0 8px 18px #16a34a2b}.btn:hover{transform:translateY(-1px)}\n    .notice{display:flex;gap:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:13px;padding:13px 15px;color:#854d0e;font-size:13px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin-bottom:20px}.stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 7px 25px #0f172a0a;position:relative;overflow:hidden}.stat:after{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,var(--blue))}.stat small{color:var(--muted);font-weight:700}.stat strong{font-size:28px;display:block;margin-top:8px}.stat span{font-size:12px;color:#94a3b8}\n    .panel{background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 7px 25px #0f172a0a;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 18px;border-bottom:1px solid var(--line)}.panel-head h2{font-size:16px;margin:0}.filters{display:flex;gap:8px}.search{min-width:290px;border:1px solid var(--line);border-radius:9px;padding:9px 11px}.mini{border:1px solid var(--line);border-radius:9px;padding:9px;background:#fff}\n    .table-wrap{overflow:auto;max-height:650px}table{border-collapse:collapse;width:100%;font-size:13px}th{position:sticky;top:0;background:#f0fdf4;color:#35604d;text-align:left;z-index:1;font-size:11px;text-transform:uppercase;letter-spacing:.05em}th,td{padding:12px 14px;border-bottom:1px solid #edf1f5;white-space:nowrap}tbody tr:hover{background:#fafbff}.name{font-weight:750}.sub{display:block;color:var(--muted);font-size:11px;margin-top:3px}.tag{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:750}.tag.green{background:#d1fae5;color:#047857}.tag.blue{background:#dcfce7;color:#166534}.tag.gray{background:#eef2f7;color:#475569}.empty{text-align:center;padding:50px;color:var(--muted)}\n    .loader{position:fixed;inset:0;background:#0b2e20dd;display:none;z-index:50;place-items:center;color:#fff;text-align:center}.loader.show{display:grid}.spinner{width:46px;height:46px;border:4px solid #ffffff2b;border-top-color:#4ade80;border-radius:50%;animation:spin .8s linear infinite;margin:auto auto 14px}@keyframes spin{to{transform:rotate(360deg)}}\n    .meta{font-size:12px;color:var(--muted);padding:12px 18px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:12px;padding:13px;display:none;margin-bottom:15px}\n.section-title{display:flex;justify-content:space-between;align-items:end;margin:28px 0 14px}.section-title h2{margin:0;font-size:20px}.section-title p{margin:5px 0 0;color:var(--muted);font-size:13px}.endpoint-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.endpoint-card{background:#fff;border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 7px 25px #0f172a0a}.endpoint-top{display:flex;justify-content:space-between;align-items:center;gap:10px}.method{font-size:10px;font-weight:850;padding:5px 8px;border-radius:7px;background:#dcfce7;color:#166534}.method.get{background:#cffafe;color:#0e7490}.endpoint-card h3{font-size:15px;margin:0}.endpoint-card p{font-size:13px;color:var(--muted);line-height:1.5;min-height:39px}.codebox{background:#123326;color:#ecfdf5;border-radius:10px;padding:12px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0}.copy{border:0;background:#dcfce7;color:#166534;font-weight:750;border-radius:8px;padding:7px 9px;cursor:pointer}.payload-label{font-size:11px;font-weight:800;color:#475569;text-transform:uppercase;letter-spacing:.05em}.flow{background:linear-gradient(135deg,#f0fdf4,#ecfdf5);border:1px solid #bbf7d0;border-radius:14px;padding:16px;margin:15px 0;color:#334155;font-size:13px}.source-list{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.source{background:white;border:1px solid var(--line);padding:12px;border-radius:11px;font-size:12px}.source b{display:block;margin-bottom:4px}.source span{color:var(--muted)}\n    @media(max-width:1100px){.layout{grid-template-columns:82px 1fr}.side{padding:20px 11px}.brand span,.nav-item span,.nav-title,.side-foot{display:none}.brand{justify-content:center}.nav-item{justify-content:center}.grid{grid-template-columns:repeat(2,1fr)}.endpoint-grid{grid-template-columns:1fr}.source-list{grid-template-columns:repeat(2,1fr)}}\n    @media(max-width:720px){.layout{display:block}.side{display:none}main{padding:18px}.top{display:block}.actions{margin-top:15px}.grid{grid-template-columns:1fr}.source-list{grid-template-columns:1fr}.panel-head{display:block}.filters{margin-top:12px;display:grid}.search{min-width:0}.table-wrap{max-height:none}}\n  </style>\n</head>\n<body>\n<div class="loader" id="loader"><div><div class="spinner"></div><b>Screening official FMCSA datasets</b><div class="sub" style="color:#cbd5e1;margin-top:8px">Census → insurance → history → New Entrant OOS</div></div></div>\n<div class="layout">\n  <aside class="side">\n    <div class="brand"><div class="logo">GV</div><span>GreenVentures</span></div>\n    <div class="nav-title">Workspace</div>\n    <a class="nav-item active" href="#dashboard">◫ <span>GreenVentures</span></a>\n    <a class="nav-item" href="#integrations">⌁ <span>n8n & API</span></a>\n    <a class="nav-item" href="#exports">⇩ <span>Exports</span></a>\n    <div class="nav-title">Verification</div>\n    <div class="nav-item">✓ <span>Insurance screening</span></div>\n    <div class="nav-item">✓ <span>New Entrant OOS</span></div>\n    <div class="side-foot"><span class="dot"></span>Official-source pipeline<br><span style="color:#64748b;display:block;margin-top:7px">Daily FMCSA snapshots</span></div>\n  </aside>\n  <main id="dashboard">\n    <div class="top">\n      <div><h1>GreenVentures</h1><p>New-venture intelligence designed for focused commercial trucking outreach.</p></div>\n      <div class="actions">\n        <select class="select" id="days"><option value="1">Previous 1 day</option><option value="3" selected>Previous 3 days</option><option value="7">Previous 7 days</option><option value="14">Previous 14 days</option><option value="30">Previous 30 days</option></select>\n        <button id="exports" class="btn" onclick="location.href=\'/download/csv\'">CSV</button><button class="btn" onclick="location.href=\'/download/excel\'">Excel</button><button class="btn primary" onclick="loadData()">Refresh data</button><button class="btn" onclick="location.href=\'/logout\'">Log out</button>\n      </div>\n    </div>\n    <div class="error" id="error"></div>\n    <div class="notice"><b>Verification meaning</b><span>No current, pending, or previous filing was found in the checked FMCSA insurance datasets at the recorded check time. This does not cover private/non-filed insurance outside FMCSA.</span></div>\n    <section class="grid">\n      <div class="stat" style="--accent:#4f46e5"><small>Initial candidates</small><strong id="initial">–</strong><span>Strict recent Census matches</span></div>\n      <div class="stat" style="--accent:#ef4444"><small>Insurance excluded</small><strong id="insurance">–</strong><span>Current, pending, or previous</span></div>\n      <div class="stat" style="--accent:#f59e0b"><small>OOS excluded</small><strong id="oos">–</strong><span>New Entrant orders found</span></div>\n      <div class="stat" style="--accent:#10b981"><small>Final qualified</small><strong id="final">–</strong><span>Ready for workflow output</span></div>\n    </section>\n    <section class="panel">\n      <div class="panel-head"><h2>Qualified carrier records</h2><div class="filters"><input class="search" id="search" placeholder="Search USDOT, company, city, state…" oninput="render()"><select class="mini" id="state" onchange="render()"><option value="">All states</option></select></div></div>\n      <div class="table-wrap"><table><thead><tr><th>USDOT</th><th>Company</th><th>Add date</th><th>Contact</th><th>Location</th><th>Units</th><th>Insurance</th><th>New Entrant</th></tr></thead><tbody id="rows"></tbody></table></div>\n      <div class="meta"><span id="window">Date window: –</span><span id="generated">Generated: –</span></div>\n    </section>\n\n    <div class="section-title" id="integrations"><div><h2>n8n & API integrations</h2><p>Production-ready endpoints for automations, complete responses, exports, and monitoring.</p></div></div>\n    <div class="flow"><b>Public API access:</b> The n8n, API, webhook, health, CSV, and Excel endpoints do not require a username, password, or API key. Anyone with an endpoint URL can use it.<br><br><b>Recommended n8n flow:</b> HTTP Request → Split Out <code>carriers</code> → Google Sheets / CRM. Use <code>/n8n/output</code> because it returns a compact automation-friendly response without the larger audit arrays.</div>\n    <div class="endpoint-grid">\n      <article class="endpoint-card"><div class="endpoint-top"><h3>n8n qualified output</h3><span class="method">GET / POST</span></div><p>Use this in n8n. It runs every qualification check and returns the final carriers in a <code>carriers</code> array.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/n8n/output">/n8n/output</div><div class="payload-label">POST payload</div><div class="codebox">{\n  "days": 3\n}</div><button class="copy" onclick="copyEndpoint(\'/n8n/output\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Complete platform response</h3><span class="method get">GET</span></div><p>Use for dashboards or debugging. Includes final carriers, exclusion counts, source details, and audit summaries.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/api/data?days=3">/api/data?days=3</div><div class="payload-label">Query payload</div><div class="codebox">days=3  // allowed: 1–30</div><button class="copy" onclick="copyEndpoint(\'/api/data?days=3\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Webhook-compatible output</h3><span class="method">GET / POST</span></div><p>Use for existing webhook clients. Returns the complete platform result and accepts the same number-of-days payload.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/webhook">/webhook</div><div class="payload-label">POST payload</div><div class="codebox">{\n  "days": 3\n}</div><button class="copy" onclick="copyEndpoint(\'/webhook\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Service health check</h3><span class="method get">GET</span></div><p>Use in Render uptime monitors or n8n before a long run. It confirms that the Flask service is online.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/health">/health</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint(\'/health\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>CSV export</h3><span class="method get">GET</span></div><p>Downloads the latest final qualified carrier list. Use for spreadsheet imports and archival exports.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/download/csv">/download/csv</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint(\'/download/csv\')">Copy endpoint</button></article>\n      <article class="endpoint-card"><div class="endpoint-top"><h3>Excel workbook</h3><span class="method get">GET</span></div><p>Downloads qualified carriers plus separate audit sheets for insurance and OOS exclusions.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/download/excel">/download/excel</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint(\'/download/excel\')">Copy endpoint</button></article>\n    </div>\n\n<script>\nlet records=[];\nconst esc=v=>String(v??\'\').replace(/[&<>"\']/g,m=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#039;\'}[m]));\nfunction render(){\n const q=document.getElementById(\'search\').value.toLowerCase().trim(), state=document.getElementById(\'state\').value;\n const list=records.filter(c=>(!state||c.phy_state===state)&&(!q||[c.usdot_number,c.legal_name,c.dba_name,c.phy_city,c.phy_state].join(\' \').toLowerCase().includes(q)));\n const body=document.getElementById(\'rows\');\n if(!list.length){body.innerHTML=\'<tr><td colspan="8" class="empty">No qualified carriers match this view.</td></tr>\';return}\n body.innerHTML=list.map(c=>`<tr><td><span class="name">${esc(c.usdot_number)}</span><span class="sub">${esc(c.docket_number||\'No docket\')}</span></td><td><span class="name">${esc(c.legal_name)}</span><span class="sub">${esc(c.dba_name||\'\')}</span></td><td><span class="tag blue">${esc(c.add_date)}</span></td><td>${esc(c.phone)}<span class="sub">${esc(c.email_address)}</span></td><td>${esc(c.phy_city)}, ${esc(c.phy_state)}<span class="sub">${esc(c.phy_zip)}</span></td><td>${esc(c.power_units)}</td><td><span class="tag green">No filing found</span><span class="sub">Codes: ${esc(c.insurance_form_codes_found)}</span></td><td><span class="tag gray">Candidate</span><span class="sub">No OOS found</span></td></tr>`).join(\'\');\n}\nasync function loadData(){\n const loader=document.getElementById(\'loader\'), err=document.getElementById(\'error\');loader.classList.add(\'show\');err.style.display=\'none\';\n try{\n  const r=await fetch(\'/api/data?days=\'+document.getElementById(\'days\').value),x=await r.json();if(!r.ok||!x.success)throw new Error(x.error||\'FMCSA request failed\');\n  records=x.carriers||[];const c=x.counts;\n  document.getElementById(\'initial\').textContent=c.strict_new_dot_candidates;document.getElementById(\'insurance\').textContent=c.excluded_for_current_pending_or_previous_insurance;document.getElementById(\'oos\').textContent=c.excluded_for_new_entrant_oos;document.getElementById(\'final\').textContent=c.final_verified_candidates;\n  document.getElementById(\'window\').textContent=`Window: ${x.date_window.start_inclusive} to before ${x.date_window.end_exclusive} • ${x.date_window.timezone}`;document.getElementById(\'generated\').textContent=\'Checked: \'+new Date(x.generated_at).toLocaleString();\n  const states=[...new Set(records.map(x=>x.phy_state).filter(Boolean))].sort();document.getElementById(\'state\').innerHTML=\'<option value="">All states</option>\'+states.map(s=>`<option>${esc(s)}</option>`).join(\'\');render();\n }catch(e){err.textContent=e.message;err.style.display=\'block\'}finally{loader.classList.remove(\'show\')}\n}\n\nfunction initializeEndpoints(){document.querySelectorAll(\'.dynamic-url\').forEach(el=>el.textContent=location.origin+el.dataset.path)}\nasync function copyEndpoint(path){try{await navigator.clipboard.writeText(location.origin+path);event.target.textContent=\'Copied\';setTimeout(()=>event.target.textContent=\'Copy endpoint\',1200)}catch(e){prompt(\'Copy endpoint:\',location.origin+path)}}\nwindow.onload=()=>{initializeEndpoints();loadData()};\n</script>\n</body></html>'
+HTML_TEMPLATE = '''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GreenVentures • FMCSA New Venture Intelligence</title>
+  <style>
+    :root{--navy:#ffffff;--navy2:#f6fff9;--ink:#123326;--muted:#648075;--line:#dcebe3;--bg:#f4faf6;--white:#fff;--green:#16a34a;--blue:#16a34a;--cyan:#059669;--amber:#f59e0b;--red:#ef4444}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+    .layout{display:grid;grid-template-columns:258px 1fr;min-height:100vh}.side{background:linear-gradient(180deg,var(--navy),var(--navy2));color:#47695b;border-right:1px solid var(--line);padding:24px 18px;position:sticky;top:0;height:100vh}
+    .brand{display:flex;align-items:center;gap:12px;color:#14532d;font-weight:800;font-size:20px;padding:4px 7px 26px}.logo{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,#16a34a,#34d399);color:white;box-shadow:0 8px 25px #16a34a35}
+    .nav-title{font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:#7b9589;margin:18px 10px 8px}.nav-item{display:flex;gap:11px;align-items:center;padding:11px 12px;border-radius:10px;margin:4px 0;color:#47695b;text-decoration:none}.nav-item:hover{background:#dcfce7;color:#166534}.nav-item.active{background:#dcfce7;color:#166534;font-weight:750}.side-foot{position:absolute;bottom:22px;left:18px;right:18px;border:1px solid #d7eadf;background:#ffffff;border-radius:12px;padding:13px;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px #10b98122;margin-right:8px}
+    main{padding:30px;min-width:0}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:24px}.top h1{font-size:27px;margin:0 0 7px}.top p{margin:0;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap}select,button,input{font:inherit}.btn,.select{border:1px solid var(--line);background:#fff;border-radius:10px;padding:10px 13px}.btn{cursor:pointer;font-weight:700}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue);box-shadow:0 8px 18px #16a34a2b}.btn:hover{transform:translateY(-1px)}
+    .notice{display:flex;gap:12px;background:#fffbeb;border:1px solid #fde68a;border-radius:13px;padding:13px 15px;color:#854d0e;font-size:13px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px;margin-bottom:20px}.stat{background:#fff;border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 7px 25px #0f172a0a;position:relative;overflow:hidden}.stat:after{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,var(--blue))}.stat small{color:var(--muted);font-weight:700}.stat strong{font-size:28px;display:block;margin-top:8px}.stat span{font-size:12px;color:#94a3b8}
+    .panel{background:#fff;border:1px solid var(--line);border-radius:15px;box-shadow:0 7px 25px #0f172a0a;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 18px;border-bottom:1px solid var(--line)}.panel-head h2{font-size:16px;margin:0}.filters{display:flex;gap:8px}.search{min-width:290px;border:1px solid var(--line);border-radius:9px;padding:9px 11px}.mini{border:1px solid var(--line);border-radius:9px;padding:9px;background:#fff}
+    .table-wrap{overflow:auto;max-height:650px}table{border-collapse:collapse;width:100%;font-size:13px}th{position:sticky;top:0;background:#f0fdf4;color:#35604d;text-align:left;z-index:1;font-size:11px;text-transform:uppercase;letter-spacing:.05em}th,td{padding:12px 14px;border-bottom:1px solid #edf1f5;white-space:nowrap}tbody tr:hover{background:#fafbff}.name{font-weight:750}.sub{display:block;color:var(--muted);font-size:11px;margin-top:3px}.tag{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:750}.tag.green{background:#d1fae5;color:#047857}.tag.blue{background:#dcfce7;color:#166534}.tag.gray{background:#eef2f7;color:#475569}.empty{text-align:center;padding:50px;color:var(--muted)}
+    .loader{position:fixed;inset:0;background:#0b2e20dd;display:none;z-index:50;place-items:center;color:#fff;text-align:center}.loader.show{display:grid}.spinner{width:46px;height:46px;border:4px solid #ffffff2b;border-top-color:#4ade80;border-radius:50%;animation:spin .8s linear infinite;margin:auto auto 14px}@keyframes spin{to{transform:rotate(360deg)}}
+    .meta{font-size:12px;color:var(--muted);padding:12px 18px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:12px;padding:13px;display:none;margin-bottom:15px}
+.section-title{display:flex;justify-content:space-between;align-items:end;margin:28px 0 14px}.section-title h2{margin:0;font-size:20px}.section-title p{margin:5px 0 0;color:var(--muted);font-size:13px}.endpoint-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.endpoint-card{background:#fff;border:1px solid var(--line);border-radius:15px;padding:18px;box-shadow:0 7px 25px #0f172a0a}.endpoint-top{display:flex;justify-content:space-between;align-items:center;gap:10px}.method{font-size:10px;font-weight:850;padding:5px 8px;border-radius:7px;background:#dcfce7;color:#166534}.method.get{background:#cffafe;color:#0e7490}.endpoint-card h3{font-size:15px;margin:0}.endpoint-card p{font-size:13px;color:var(--muted);line-height:1.5;min-height:39px}.codebox{background:#123326;color:#ecfdf5;border-radius:10px;padding:12px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:10px 0}.copy{border:0;background:#dcfce7;color:#166534;font-weight:750;border-radius:8px;padding:7px 9px;cursor:pointer}.payload-label{font-size:11px;font-weight:800;color:#475569;text-transform:uppercase;letter-spacing:.05em}.flow{background:linear-gradient(135deg,#f0fdf4,#ecfdf5);border:1px solid #bbf7d0;border-radius:14px;padding:16px;margin:15px 0;color:#334155;font-size:13px}.source-list{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.source{background:white;border:1px solid var(--line);padding:12px;border-radius:11px;font-size:12px}.source b{display:block;margin-bottom:4px}.source span{color:var(--muted)}
+    @media(max-width:1100px){.layout{grid-template-columns:82px 1fr}.side{padding:20px 11px}.brand span,.nav-item span,.nav-title,.side-foot{display:none}.brand{justify-content:center}.nav-item{justify-content:center}.grid{grid-template-columns:repeat(2,1fr)}.endpoint-grid{grid-template-columns:1fr}.source-list{grid-template-columns:repeat(2,1fr)}}
+    @media(max-width:720px){.layout{display:block}.side{display:none}main{padding:18px}.top{display:block}.actions{margin-top:15px}.grid{grid-template-columns:1fr}.source-list{grid-template-columns:1fr}.panel-head{display:block}.filters{margin-top:12px;display:grid}.search{min-width:0}.table-wrap{max-height:none}}
+  </style>
+</head>
+<body>
+<div class="loader" id="loader"><div><div class="spinner"></div><b>Screening official FMCSA datasets</b><div class="sub" style="color:#cbd5e1;margin-top:8px">Census → insurance → history → New Entrant OOS</div></div></div>
+<div class="layout">
+  <aside class="side">
+    <div class="brand"><div class="logo">GV</div><span>GreenVentures</span></div>
+    <div class="nav-title">Workspace</div>
+    <a class="nav-item active" href="#dashboard">◫ <span>GreenVentures</span></a>
+    <a class="nav-item" href="#integrations">⌁ <span>n8n & API</span></a>
+    <a class="nav-item" href="#exports">⇩ <span>Exports</span></a>
+    <div class="nav-title">Verification</div>
+    <div class="nav-item">✓ <span>Insurance screening</span></div>
+    <div class="nav-item">✓ <span>New Entrant OOS</span></div>
+    <div class="side-foot"><span class="dot"></span>Official-source pipeline<br><span style="color:#64748b;display:block;margin-top:7px">Daily FMCSA snapshots</span></div>
+  </aside>
+  <main id="dashboard">
+    <div class="top">
+      <div><h1>GreenVentures</h1><p>New-venture intelligence designed for focused commercial trucking outreach.</p></div>
+      <div class="actions">
+        <select class="select" id="days"><option value="1">Previous 1 day</option><option value="3" selected>Previous 3 days</option><option value="7">Previous 7 days</option><option value="14">Previous 14 days</option><option value="30">Previous 30 days</option></select>
+        <button id="exports" class="btn" onclick="location.href='/download/csv'">CSV</button><button class="btn" onclick="location.href='/download/excel'">Excel</button><button class="btn primary" onclick="loadData()">Refresh data</button><button class="btn" onclick="location.href='/logout'">Log out</button>
+      </div>
+    </div>
+    <div class="error" id="error"></div>
+    <div class="notice"><b>Verification meaning</b><span>No current, pending, or previous filing was found in the checked FMCSA insurance datasets at the recorded check time. This does not cover private/non-filed insurance outside FMCSA.</span></div>
+    <section class="grid">
+      <div class="stat" style="--accent:#4f46e5"><small>Initial candidates</small><strong id="initial">–</strong><span>Strict recent Census matches</span></div>
+      <div class="stat" style="--accent:#ef4444"><small>Insurance excluded</small><strong id="insurance">–</strong><span>Current, pending, or previous</span></div>
+      <div class="stat" style="--accent:#f59e0b"><small>OOS excluded</small><strong id="oos">–</strong><span>New Entrant orders found</span></div>
+      <div class="stat" style="--accent:#10b981"><small>Final qualified</small><strong id="final">–</strong><span>Ready for workflow output</span></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Qualified carrier records</h2><div class="filters"><input class="search" id="search" placeholder="Search USDOT, company, city, state…" oninput="render()"><select class="mini" id="state" onchange="render()"><option value="">All states</option></select></div></div>
+      <div class="table-wrap"><table><thead><tr><th>USDOT</th><th>Company</th><th>Add date</th><th>Contact</th><th>Location</th><th>Units</th><th>Insurance</th><th>New Entrant</th></tr></thead><tbody id="rows"></tbody></table></div>
+      <div class="meta"><span id="window">Date window: –</span><span id="generated">Generated: –</span></div>
+    </section>
+
+    <div class="section-title" id="integrations"><div><h2>n8n & API integrations</h2><p>Production-ready endpoints for automations, complete responses, exports, and monitoring.</p></div></div>
+    <div class="flow"><b>Public API access:</b> The n8n, API, webhook, health, CSV, and Excel endpoints do not require a username, password, or API key. Anyone with an endpoint URL can use it.<br><br><b>Recommended n8n flow:</b> HTTP Request → Split Out <code>carriers</code> → Google Sheets / CRM. Use <code>/n8n/output</code> because it returns a compact automation-friendly response without the larger audit arrays.</div>
+    <div class="endpoint-grid">
+      <article class="endpoint-card"><div class="endpoint-top"><h3>n8n qualified output</h3><span class="method">GET / POST</span></div><p>Use this in n8n. It runs every qualification check and returns the final carriers in a <code>carriers</code> array.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/n8n/output">/n8n/output</div><div class="payload-label">POST payload</div><div class="codebox">{
+  "days": 3
+}</div><button class="copy" onclick="copyEndpoint('/n8n/output')">Copy endpoint</button></article>
+      <article class="endpoint-card"><div class="endpoint-top"><h3>Complete platform response</h3><span class="method get">GET</span></div><p>Use for dashboards or debugging. Includes final carriers, exclusion counts, source details, and audit summaries.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/api/data?days=3">/api/data?days=3</div><div class="payload-label">Query payload</div><div class="codebox">days=3  // allowed: 1–30</div><button class="copy" onclick="copyEndpoint('/api/data?days=3')">Copy endpoint</button></article>
+      <article class="endpoint-card"><div class="endpoint-top"><h3>Webhook-compatible output</h3><span class="method">GET / POST</span></div><p>Use for existing webhook clients. Returns the complete platform result and accepts the same number-of-days payload.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/webhook">/webhook</div><div class="payload-label">POST payload</div><div class="codebox">{
+  "days": 3
+}</div><button class="copy" onclick="copyEndpoint('/webhook')">Copy endpoint</button></article>
+      <article class="endpoint-card"><div class="endpoint-top"><h3>Service health check</h3><span class="method get">GET</span></div><p>Use in Render uptime monitors or n8n before a long run. It confirms that the Flask service is online.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/health">/health</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint('/health')">Copy endpoint</button></article>
+      <article class="endpoint-card"><div class="endpoint-top"><h3>CSV export</h3><span class="method get">GET</span></div><p>Downloads the latest final qualified carrier list. Use for spreadsheet imports and archival exports.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/download/csv">/download/csv</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint('/download/csv')">Copy endpoint</button></article>
+      <article class="endpoint-card"><div class="endpoint-top"><h3>Excel workbook</h3><span class="method get">GET</span></div><p>Downloads qualified carriers plus separate audit sheets for insurance and OOS exclusions.</p><div class="payload-label">Endpoint</div><div class="codebox dynamic-url" data-path="/download/excel">/download/excel</div><div class="payload-label">Payload</div><div class="codebox">No payload required</div><button class="copy" onclick="copyEndpoint('/download/excel')">Copy endpoint</button></article>
+    </div>
+
+<script>
+let records=[];
+const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+function render(){
+ const q=document.getElementById('search').value.toLowerCase().trim(), state=document.getElementById('state').value;
+ const list=records.filter(c=>((!state||c.phy_state===state)&&(!q||[c.usdot_number,c.legal_name,c.dba_name,c.phy_city,c.phy_state].join(' ').toLowerCase().includes(q))));
+ const body=document.getElementById('rows');
+ if(!list.length){body.innerHTML='<tr><td colspan="8" class="empty">No qualified carriers match this view.</td></tr>';return}
+ body.innerHTML=list.map(c=>`<tr><td><span class="name">${esc(c.usdot_number)}</span><span class="sub">${esc(c.docket_number||'No docket')}</span></td><td><span class="name">${esc(c.legal_name)}</span><span class="sub">${esc(c.dba_name||'')}</span></td><td><span class="tag blue">${esc(c.add_date)}</span></td><td>${esc(c.phone)}<span class="sub">${esc(c.email_address)}</span></td><td>${esc(c.phy_city)}, ${esc(c.phy_state)}<span class="sub">${esc(c.phy_zip)}</span></td><td>${esc(c.power_units)}</td><td><span class="tag green">No filing found</span><span class="sub">Codes: ${esc(c.insurance_form_codes_found)}</span></td><td><span class="tag gray">Candidate</span><span class="sub">No OOS found</span></td></tr>`).join('');
+}
+async function loadData(){
+ const loader=document.getElementById('loader'), err=document.getElementById('error');loader.classList.add('show');err.style.display='none';
+ try{
+  const r=await fetch('/api/data?days='+document.getElementById('days').value),x=await r.json();if(!r.ok||!x.success)throw new Error(x.error||'FMCSA request failed');
+  records=x.carriers||[];const c=x.counts;
+  document.getElementById('initial').textContent=c.strict_new_dot_candidates;document.getElementById('insurance').textContent=c.excluded_for_current_pending_or_previous_insurance;document.getElementById('oos').textContent=c.excluded_for_new_entrant_oos;document.getElementById('final').textContent=c.final_verified_candidates;
+  document.getElementById('window').textContent = `Window: ${x.date_window.start_inclusive} to before ${x.date_window.end_exclusive} • ${x.date_window.timezone}`;document.getElementById('generated').textContent='Checked: '+new Date(x.generated_at).toLocaleString();
+  const states=[...new Set(records.map(x=>x.phy_state).filter(Boolean))].sort();document.getElementById('state').innerHTML='<option value="">All states</option>'+states.map(s=>`<option>${esc(s)}</option>`).join('');render();
+ }catch(e){err.textContent=e.message;err.style.display='block'}finally{loader.classList.remove('show')}
+}
+
+function initializeEndpoints(){document.querySelectorAll('.dynamic-url').forEach(el=>el.textContent=location.origin+el.dataset.path)}
+async function copyEndpoint(path){try{await navigator.clipboard.writeText(location.origin+path);event.target.textContent='Copied';setTimeout(()=>event.target.textContent='Copy endpoint',1200)}catch(e){prompt('Copy endpoint:',location.origin+path)}}
+window.onload=()=>{initializeEndpoints();loadData()};
+</script>
+</body>
+</html>'''
 
 
 LOGIN_TEMPLATE = """<!doctype html>
+
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+
 <title>Sign in • GreenVentures</title><style>
+
 :root{--green:#16a34a;--dark:#123326;--muted:#648075;--line:#dcebe3}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(circle at 15% 15%,#dcfce7,transparent 34%),linear-gradient(135deg,#f7fff9,#edf8f1);font-family:Inter,system-ui,sans-serif;color:var(--dark)}
+
 .shell{width:min(940px,92vw);min-height:560px;background:white;border:1px solid var(--line);border-radius:24px;box-shadow:0 28px 80px #14532d20;display:grid;grid-template-columns:1.08fr .92fr;overflow:hidden}.visual{padding:54px;background:linear-gradient(150deg,#14532d,#16a34a);color:white;display:flex;flex-direction:column;justify-content:space-between}.brand{font-size:23px;font-weight:850}.visual h1{font-size:40px;line-height:1.08;margin:0 0 16px}.visual p{color:#dcfce7;line-height:1.65}.pill{display:inline-block;padding:7px 11px;background:#ffffff17;border:1px solid #ffffff2b;border-radius:999px;font-size:12px}.form{padding:54px;display:flex;flex-direction:column;justify-content:center}.form h2{font-size:27px;margin:0 0 8px}.sub{color:var(--muted);font-size:14px;margin-bottom:27px}label{font-size:12px;font-weight:800;margin:0 0 7px}input{width:100%;padding:13px;border:1px solid var(--line);border-radius:10px;margin-bottom:17px;font:inherit;outline:none}input:focus{border-color:#22c55e;box-shadow:0 0 0 4px #22c55e18}button{padding:13px;border:0;border-radius:10px;background:var(--green);color:white;font-weight:800;font-size:15px;cursor:pointer;box-shadow:0 10px 25px #16a34a2e}.error{background:#fee2e2;color:#991b1b;padding:10px;border-radius:9px;font-size:13px;margin-bottom:16px}.setup{background:#fff7ed;color:#9a3412;padding:10px;border-radius:9px;font-size:12px;margin-bottom:16px}.foot{font-size:11px;color:#94a3b8;margin-top:18px;text-align:center}@media(max-width:760px){.shell{grid-template-columns:1fr}.visual{display:none}.form{padding:38px 26px;min-height:520px}}
+
 </style></head><body><div class="shell"><section class="visual"><div class="brand">GreenVentures</div><div><span class="pill">Secure intelligence workspace</span><h1>Better timing. Cleaner trucking prospects.</h1><p>Access recently added FMCSA ventures screened against current, pending, and previous insurance records.</p></div><small>Protected access • Official-source screening</small></section><form class="form" method="post"><h2>Welcome back</h2><div class="sub">Sign in to enter the GreenVentures platform.</div>{% if config_error %}<div class="setup">Set PLATFORM_PASSWORD and FLASK_SECRET_KEY in Render before signing in.</div>{% endif %}{% if error %}<div class="error">{{ error }}</div>{% endif %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next_url }}"><label>USERNAME</label><input name="username" autocomplete="username" required><label>PASSWORD</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Sign in securely</button><div class="foot">Access is limited to authorized GreenVentures users.</div></form></div></body></html>"""
 
 
@@ -468,6 +619,7 @@ LOGIN_TEMPLATE = """<!doctype html>
 def login():
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
     error = ""
+
     if "login_csrf" not in session:
         session["login_csrf"] = secrets.token_urlsafe(24)
 
@@ -549,6 +701,7 @@ def n8n_output():
     """
     payload = request.get_json(silent=True) or {} if request.method == "POST" else request.args
     days = parse_days(payload.get("days", DEFAULT_DAYS))
+
     try:
         result = get_or_generate(days)
         return jsonify({
